@@ -17,3 +17,6 @@
 
 # vhs renders — commit GIFs with `git add -f` only when you want them in the repo
 tapes/out/
+
+# Founded OS
+.founded/

@@ -32,6 +32,7 @@ pub fn get_commands() -> Vec<Command> {
         Command { name: "Computed Column", description: "Add a derived column", shortcut: "c" },
         Command { name: "Group By", description: "Pivot / group-by wizard", shortcut: "g" },
         Command { name: "Join", description: "Join with another file", shortcut: "J" },
+        Command { name: "Back to Table", description: "Leave query result, show the full data table", shortcut: "Esc" },
         Command { name: "Undo", description: "Restore previous view", shortcut: "u" },
         Command { name: "Go to Top", description: "Jump to first row", shortcut: "gg" },
         Command { name: "Go to Bottom", description: "Jump to last row", shortcut: "G" },

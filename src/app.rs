@@ -115,6 +115,19 @@ pub struct App {
     pub total_rows: usize,
     pub filtered_rows: usize,
 
+    /// Column names of the base `data` table as loaded — never changes, even
+    /// after a query swaps out `columns`. Used to hint SQL/AI mode.
+    pub data_columns: Vec<String>,
+
+    /// True while the table shows an ad-hoc query result (AI / SQL / formula /
+    /// group-by) rather than the base `data` table. Such results are held
+    /// whole in `rows`, so we must not let `refresh_data` re-page over `data`.
+    pub viewing_query_result: bool,
+
+    /// The SQL that produced the current query result, so Export can write the
+    /// result the user is looking at (not the base table). `None` on the base table.
+    pub result_sql: Option<String>,
+
     // Cursor
     pub cursor_row: usize,
     pub cursor_col: usize,
@@ -271,6 +284,7 @@ pub struct CellEditRecord {
 impl App {
     pub fn new(file_path: String, file_format: FileFormat, engine: DataEngine) -> Result<Self> {
         let columns = engine.get_schema()?;
+        let data_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let total_rows = engine.get_total_rows()?;
         let col_count = columns.len();
         let col_widths = vec![15u16; col_count];
@@ -285,6 +299,9 @@ impl App {
             rows: Vec::new(),
             total_rows,
             filtered_rows: total_rows,
+            data_columns,
+            viewing_query_result: false,
+            result_sql: None,
             cursor_row: 0,
             cursor_col: 0,
             scroll_offset: 0,
@@ -366,6 +383,13 @@ impl App {
     }
 
     pub fn refresh_data(&mut self) -> Result<()> {
+        // A query result is held whole in `rows`; re-paging `data` here would
+        // overwrite it with mismatched base-table data. Scrolling/sorting a
+        // result is a no-op until the user returns to the base table.
+        if self.viewing_query_result {
+            return Ok(());
+        }
+
         let order_by = self.build_order_by();
         let where_clause = self.build_where_clause();
 
@@ -435,6 +459,28 @@ impl App {
         }
     }
 
+    /// Return to the full base `data` table from a query result, clearing
+    /// filters and sort so the user gets a clean slate to work from.
+    pub fn reset_to_base_table(&mut self) -> Result<()> {
+        self.viewing_query_result = false;
+        self.result_sql = None;
+        self.columns = self.engine.get_schema()?;
+        let n = self.columns.len();
+        self.col_widths = vec![15u16; n];
+        self.hidden_cols = vec![false; n];
+        self.sort_column = None;
+        self.sort_direction = SortDirection::None;
+        self.filters.clear();
+        self.scroll_offset = 0;
+        self.col_scroll_offset = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.view_stack.clear();
+        self.refresh_data()?;
+        self.auto_size_columns();
+        Ok(())
+    }
+
     pub fn push_view_state(&mut self) {
         self.view_stack.push(ViewState {
             sort_column: self.sort_column,
@@ -482,5 +528,59 @@ impl App {
         let vis_cols = self.visible_columns();
         let (actual_col, _) = vis_cols.get(self.cursor_col)?;
         row.get(*actual_col).map(|s| s.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::engine::DataEngine;
+
+    fn load_employees() -> App {
+        let engine = DataEngine::new().unwrap();
+        engine.load_file("examples/employees.csv", "csv").unwrap();
+        App::new(
+            "examples/employees.csv".to_string(),
+            FileFormat::Csv,
+            engine,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reset_restores_base_table_after_query_result() {
+        let mut app = load_employees();
+        app.refresh_data().unwrap();
+        let base_cols = app.data_columns.clone();
+        let base_row_count = app.filtered_rows;
+        assert!(base_row_count > 0, "fixture should have rows");
+        assert!(base_cols.len() >= 5, "fixture should have several columns");
+
+        // Simulate an AI/SQL query result replacing the view with a narrow,
+        // detached projection.
+        app.viewing_query_result = true;
+        app.columns = vec![ColumnInfo {
+            name: "total".to_string(),
+            data_type: "VARCHAR".to_string(),
+        }];
+        app.rows = vec![vec!["999".to_string()]];
+        app.filtered_rows = 1;
+
+        // While detached, refresh_data must NOT clobber the in-memory result.
+        app.refresh_data().unwrap();
+        assert_eq!(app.columns.len(), 1, "refresh should be a no-op on a result");
+        assert_eq!(app.rows, vec![vec!["999".to_string()]]);
+
+        // Returning restores the full base table.
+        app.reset_to_base_table().unwrap();
+        assert!(!app.viewing_query_result);
+        assert_eq!(
+            app.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            base_cols
+        );
+        assert_eq!(app.filtered_rows, base_row_count);
+        assert!(!app.rows.is_empty(), "rows should be reloaded from data");
+        assert!(app.filters.is_empty());
+        assert_eq!(app.sort_column, None);
     }
 }

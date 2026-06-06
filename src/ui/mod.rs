@@ -587,7 +587,7 @@ fn render_help(f: &mut Frame, _app: &App, colors: &theme::ThemeColors) {
         ]),
         ("AI & SQL", vec![
             ("Ctrl+K", "AI natural language query"),
-            ("Ctrl+Q", "Direct SQL query"),
+            ("Ctrl+Q", "Direct SQL query — your data is the table 'data'"),
         ]),
         ("View", vec![
             ("Enter", "Cell detail view"),

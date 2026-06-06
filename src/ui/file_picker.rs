@@ -8,17 +8,27 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 use ratatui::Terminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 struct PickerState {
     all_files: Vec<PathBuf>,
+    root: PathBuf,
     query: String,
     cursor: usize,
     colors: ThemeColors,
 }
 
 impl PickerState {
+    /// Path shown to the user — relative to the directory xeli was launched in,
+    /// so nested files like `data/sales.csv` stay distinguishable.
+    fn display_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    }
+
     fn filtered(&self) -> Vec<&PathBuf> {
         if self.query.is_empty() {
             return self.all_files.iter().collect();
@@ -26,12 +36,7 @@ impl PickerState {
         let q = self.query.to_lowercase();
         self.all_files
             .iter()
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| fuzzy_contains(&n.to_lowercase(), &q))
-                    .unwrap_or(false)
-            })
+            .filter(|p| fuzzy_contains(&self.display_path(p).to_lowercase(), &q))
             .collect()
     }
 }
@@ -59,16 +64,22 @@ pub fn pick(
 ) -> Result<Option<PathBuf>> {
     let mut state = PickerState {
         all_files: files,
+        root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         query: String::new(),
         cursor: 0,
         colors: get_theme_colors(theme),
     };
 
+    // How many rows the list pane can show — kept in sync by draw() so PageUp/Down
+    // jump by a real screenful.
+    let mut page = 10usize;
+
     loop {
-        terminal.draw(|f| draw(f, &state))?;
+        terminal.draw(|f| page = draw(f, &state).max(1))?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                let len = state.filtered().len();
                 match (key.modifiers, key.code) {
                     (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(None),
                     (_, KeyCode::Esc) => return Ok(None),
@@ -78,28 +89,28 @@ pub fn pick(
                             return Ok(Some((*pick).clone()));
                         }
                     }
-                    (_, KeyCode::Up) => {
-                        if state.cursor > 0 {
-                            state.cursor -= 1;
+                    // Up / Ctrl+P — wrap to bottom from the top.
+                    (_, KeyCode::Up) | (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
+                        if len > 0 {
+                            state.cursor = if state.cursor == 0 { len - 1 } else { state.cursor - 1 };
                         }
                     }
-                    (_, KeyCode::Down) => {
-                        let len = state.filtered().len();
-                        if state.cursor + 1 < len {
-                            state.cursor += 1;
+                    // Down / Ctrl+N — wrap to top from the bottom.
+                    (_, KeyCode::Down) | (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
+                        if len > 0 {
+                            state.cursor = if state.cursor + 1 >= len { 0 } else { state.cursor + 1 };
                         }
                     }
-                    (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
-                        if state.cursor > 0 {
-                            state.cursor -= 1;
+                    (_, KeyCode::PageUp) => {
+                        state.cursor = state.cursor.saturating_sub(page);
+                    }
+                    (_, KeyCode::PageDown) => {
+                        if len > 0 {
+                            state.cursor = (state.cursor + page).min(len - 1);
                         }
                     }
-                    (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
-                        let len = state.filtered().len();
-                        if state.cursor + 1 < len {
-                            state.cursor += 1;
-                        }
-                    }
+                    (_, KeyCode::Home) => state.cursor = 0,
+                    (_, KeyCode::End) => state.cursor = len.saturating_sub(1),
                     (_, KeyCode::Backspace) => {
                         state.query.pop();
                         state.cursor = 0;
@@ -115,11 +126,20 @@ pub fn pick(
     }
 }
 
-fn draw(f: &mut Frame, state: &PickerState) {
+/// Draws the picker and returns how many file rows the list pane can show, so
+/// the event loop can page by a real screenful.
+fn draw(f: &mut Frame, state: &PickerState) -> usize {
     let area = centered_rect(70, 70, f.area());
 
+    let filtered = state.filtered();
+    let title = if state.query.is_empty() {
+        format!(" Pick a data file · {} found ", state.all_files.len())
+    } else {
+        format!(" Pick a data file · {}/{} match ", filtered.len(), state.all_files.len())
+    };
+
     let block = Block::default()
-        .title(" Pick a data file ")
+        .title(title)
         .title_style(Style::default().fg(state.colors.accent).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -165,13 +185,12 @@ fn draw(f: &mut Frame, state: &PickerState) {
     f.render_widget(Paragraph::new(sep), chunks[1]);
 
     // File list
-    let filtered = state.filtered();
     let max_items = chunks[2].height as usize;
     let mut lines: Vec<Line> = Vec::new();
 
     if filtered.is_empty() {
         let msg = if state.all_files.is_empty() {
-            "No supported data files in this directory.  Try: xeli path/to/file.csv"
+            "No supported data files here.  Try: xeli path/to/file.csv"
         } else {
             "No matches"
         };
@@ -180,22 +199,30 @@ fn draw(f: &mut Frame, state: &PickerState) {
             Style::default().fg(state.colors.muted),
         )));
     } else {
-        let start = state.cursor.saturating_sub(max_items.saturating_sub(1));
+        // Center the cursor in the window where possible, clamped to the ends.
+        let start = if filtered.len() <= max_items {
+            0
+        } else {
+            state
+                .cursor
+                .saturating_sub(max_items / 2)
+                .min(filtered.len() - max_items)
+        };
         for (offset, path) in filtered.iter().skip(start).take(max_items).enumerate() {
             let idx = start + offset;
             let is_cursor = idx == state.cursor;
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string();
+            let name = state.display_path(path);
             let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
                 .map(|s| s.to_uppercase())
                 .unwrap_or_else(|| "?".to_string());
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            let size_str = human_size(size);
+            let meta = std::fs::metadata(path);
+            let size_str = human_size(meta.as_ref().map(|m| m.len()).unwrap_or(0));
+            let when = meta
+                .and_then(|m| m.modified())
+                .map(relative_time)
+                .unwrap_or_default();
 
             let style = if is_cursor {
                 Style::default()
@@ -211,19 +238,61 @@ fn draw(f: &mut Frame, state: &PickerState) {
                 Span::styled(prefix, style),
                 Span::styled(format!("[{:<4}] ", ext), Style::default().fg(state.colors.muted)),
                 Span::styled(name, style),
-                Span::styled(format!("   {}", size_str), Style::default().fg(state.colors.muted)),
+                Span::styled(
+                    format!("   {:>8}", size_str),
+                    Style::default().fg(state.colors.muted),
+                ),
+                Span::styled(
+                    format!("   {:>9}", when),
+                    Style::default().fg(state.colors.muted),
+                ),
             ]));
         }
     }
 
     f.render_widget(Paragraph::new(lines), chunks[2]);
 
-    // Footer hints
-    let footer = Line::from(Span::styled(
-        " Type to filter · ↑↓ select · Enter:open · Esc:quit ",
-        Style::default().fg(state.colors.muted),
-    ));
+    // Footer hints + position
+    let pos = if filtered.is_empty() {
+        String::new()
+    } else {
+        format!("{}/{}  ", state.cursor + 1, filtered.len())
+    };
+    let footer = Line::from(vec![
+        Span::styled(
+            " Type to filter · ↑↓ select · Enter open · Esc quit ",
+            Style::default().fg(state.colors.muted),
+        ),
+        Span::styled(
+            format!("· {}", pos),
+            Style::default().fg(state.colors.accent2),
+        ),
+    ]);
     f.render_widget(Paragraph::new(footer), chunks[3]);
+
+    max_items
+}
+
+/// Compact "time since modified" label, e.g. `2h`, `3d`, `5mo`. Keeps the picker
+/// list legible since files are sorted newest-first.
+fn relative_time(t: std::time::SystemTime) -> String {
+    let secs = match std::time::SystemTime::now().duration_since(t) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return "now".to_string(), // mtime in the future — clock skew
+    };
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else if secs < 2_592_000 {
+        format!("{}d ago", secs / 86_400)
+    } else if secs < 31_536_000 {
+        format!("{}mo ago", secs / 2_592_000)
+    } else {
+        format!("{}y ago", secs / 31_536_000)
+    }
 }
 
 fn human_size(bytes: u64) -> String {

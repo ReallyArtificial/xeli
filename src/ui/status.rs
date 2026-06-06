@@ -89,6 +89,9 @@ fn mode_context(app: &App) -> String {
 
 fn key_hints(app: &App) -> String {
     match &app.mode {
+        AppMode::Normal if app.viewing_query_result => {
+            " Viewing query result · Esc or u: back to full table · e export · / find · t theme · q quit ".to_string()
+        }
         AppMode::Normal => {
             " Ctrl+K AI · Ctrl+Q SQL · / find · f filter · s sort · g group · J join · = formula · e export · t theme · ? help · q quit ".to_string()
         }
@@ -99,7 +102,14 @@ fn key_hints(app: &App) -> String {
             AiKeyStage::PickProvider => " j/k:choose provider  Enter:next  Esc:cancel ".to_string(),
             AiKeyStage::EnterKey => " Paste API key  Enter:save  Esc:cancel ".to_string(),
         },
-        AppMode::SqlQuery => " DuckDB SQL  Enter:run  Up/Down:history  Esc:cancel ".to_string(),
+        AppMode::SqlQuery => {
+            let cols = if app.data_columns.len() > 8 {
+                format!("{}, …", app.data_columns[..8].join(", "))
+            } else {
+                app.data_columns.join(", ")
+            };
+            format!(" table: data ({})  ·  Enter:run  Up/Down:history  Esc:cancel ", cols)
+        }
         AppMode::CellDetail => " Esc:close ".to_string(),
         AppMode::CellEdit => " ←→:move cursor  Enter:save  Esc:cancel ".to_string(),
         AppMode::ColumnStats => " Esc:close ".to_string(),

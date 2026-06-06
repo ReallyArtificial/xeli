@@ -107,9 +107,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, colors: &ThemeColors) {
         .height(1)
         .bottom_margin(0);
 
-    // Build data rows
-    let rows: Vec<Row> = app
-        .rows
+    // Build data rows. For a base table `rows` is already the current page; for
+    // an in-memory query result `rows` holds the whole set, so slice by
+    // scroll_offset to scroll. Either way `actual_row = scroll_offset + idx`.
+    let display_rows: &[Vec<String>] = if app.viewing_query_result {
+        app.rows.get(app.scroll_offset..).unwrap_or(&[])
+    } else {
+        &app.rows
+    };
+    let rows: Vec<Row> = display_rows
         .iter()
         .enumerate()
         .map(|(display_idx, row_data)| {

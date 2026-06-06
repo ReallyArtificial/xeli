@@ -4,6 +4,24 @@ All notable changes to xeli are documented here. Format follows [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-07
+
+### Added
+- **Recursive file picker**: running `xeli` with no args now searches the current directory *and subdirectories* (up to 4 levels, skipping `node_modules`, `target`, `.git`, etc.), shows paths relative to the launch dir, and displays a match count, modified-time column, and `cursor/total` position. Added `PageUp`/`PageDown`/`Home`/`End` and wrap-around navigation.
+- **SQL mode discoverability**: `Ctrl+Q` now pre-fills `SELECT * FROM data` and shows the table name + column list (`table: data (…)`) so you no longer have to guess the table name. DuckDB binder errors are trimmed and, for wrong-table/column mistakes, point you at `data` and its columns.
+- **Back to the full table**: after an AI/SQL/formula/group-by result, press `Esc` (or `u`, or the new *Back to Table* command) to return to the base table. Structural ops (`s`/`f`/`g`/`c`/`=`/`J`/`v`/`Ctrl+I`) snap back automatically.
+- **Export respects the view**: exporting while viewing a query result now writes that result, not the base table.
+
+### Fixed
+- **Search now scans the whole table**, not just the loaded 100-row page; results are filter-aware and ordered consistently with the view.
+- **Column stats & histograms respect active filters** instead of always reporting on the full table.
+- **Group-by** no longer fails on column names containing spaces or parentheses (the aggregate alias is now quoted).
+- **Join** no longer errors or produces ambiguous columns when both files share a column name (overlapping right-side columns get a `_2` suffix).
+- Editing a cell while viewing a query result is blocked (it could corrupt the wrong base-table row); scrolling a query result past one screen now works.
+- Pagination, rowid lookup, and search share one deterministic ordering, so highlights, the cursor, and cell edits always line up.
+- Mouse click-to-select no longer lands on the wrong row when the filter bar is visible.
+- Guarded a potential panic in filter mode with zero visible columns; removed a redundant re-query while scrolling.
+
 ## [0.1.3] — 2026-05-21
 
 ### Changed
@@ -41,7 +59,8 @@ All notable changes to xeli are documented here. Format follows [Keep a Changelo
 - Command palette (`Ctrl+P`), full undo stack (`u`).
 - Per-platform binaries via cargo-dist: macOS arm64/x86_64, Linux arm64/x86_64.
 
-[Unreleased]: https://github.com/josharsh/xeli/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/josharsh/xeli/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/josharsh/xeli/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/josharsh/xeli/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/josharsh/xeli/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/josharsh/xeli/compare/v0.1.0...v0.1.1

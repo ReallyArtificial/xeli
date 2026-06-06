@@ -39,6 +39,34 @@ pub fn handle_key(app: &mut App, key: KeyEvent, ai_tx: &mpsc::UnboundedSender<Ap
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSender<AppEvent>) {
+    // While viewing an ad-hoc query result (AI/SQL/formula/group-by), return to
+    // the base table before doing anything that's defined over `data`.
+    if app.viewing_query_result {
+        // Esc is the dedicated "back to the full table" key.
+        if key.code == KeyCode::Esc {
+            return_to_base_table(app);
+            return;
+        }
+        // These ops re-derive from `data`, so snap back first, then let the key
+        // fall through to operate on the real table.
+        let is_structural = matches!(
+            (key.modifiers, key.code),
+            (_, KeyCode::Char('s'))
+                | (_, KeyCode::Char('f'))
+                | (_, KeyCode::Char('F'))
+                | (_, KeyCode::Char('g'))
+                | (_, KeyCode::Char('c'))
+                | (_, KeyCode::Char('='))
+                | (_, KeyCode::Char('J'))
+                | (_, KeyCode::Char('v'))
+                | (KeyModifiers::CONTROL, KeyCode::Char('i'))
+        );
+        if is_structural {
+            return_to_base_table(app);
+            // fall through — the match below now runs against the base table
+        }
+    }
+
     let vis_col_count = app.visible_columns().len();
     let row_count = app.filtered_rows;
 
@@ -49,9 +77,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSend
             enter_ai_or_key_setup(app);
         }
         (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
-            app.mode = AppMode::SqlQuery;
-            app.sql_input.clear();
-            app.sql_history_idx = None;
+            enter_sql_mode(app);
         }
 
         // Quit
@@ -228,7 +254,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSend
         (KeyModifiers::CONTROL, KeyCode::Char('i')) => {
             let vis_cols = app.visible_columns();
             if let Some((_, col)) = vis_cols.get(app.cursor_col) {
-                match app.engine.get_column_stats(&col.name) {
+                match app.engine.get_column_stats(&col.name, app.build_where_clause().as_deref()) {
                     Ok(stats) => {
                         app.stats_data = stats;
                         app.mode = AppMode::ColumnStats;
@@ -302,6 +328,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSend
         }
 
         // Edit cell
+        (_, KeyCode::Char('i')) if app.viewing_query_result => {
+            // A query result is detached from the base table, so a cell here has
+            // no rowid to write back to. Editing would corrupt the wrong row.
+            app.status_message =
+                Some("Can't edit a query result — press Esc to return to the table".to_string());
+        }
         (_, KeyCode::Char('i')) => {
             let value = app
                 .current_cell_value()
@@ -318,12 +350,16 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSend
             app.mode = AppMode::CellEdit;
         }
 
-        // Undo
+        // Undo (also the way out of a query result)
         (_, KeyCode::Char('u')) => {
-            match app.pop_view_state() {
-                Ok(true) => app.status_message = Some("Undo".to_string()),
-                Ok(false) => app.status_message = Some("Nothing to undo".to_string()),
-                Err(e) => app.error_message = Some(format!("Undo error: {}", e)),
+            if app.viewing_query_result {
+                return_to_base_table(app);
+            } else {
+                match app.pop_view_state() {
+                    Ok(true) => app.status_message = Some("Undo".to_string()),
+                    Ok(false) => app.status_message = Some("Nothing to undo".to_string()),
+                    Err(e) => app.error_message = Some(format!("Undo error: {}", e)),
+                }
             }
         }
 
@@ -338,7 +374,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSend
         (_, KeyCode::Char('v')) => {
             let vis_cols = app.visible_columns();
             if let Some((_, col)) = vis_cols.get(app.cursor_col) {
-                match app.engine.get_histogram_data(&col.name) {
+                match app.engine.get_histogram_data(&col.name, app.build_where_clause().as_deref()) {
                     Ok((data, min, max, avg)) => {
                         app.sparkline_data = data;
                         app.sparkline_min = min;
@@ -419,7 +455,9 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) {
         _ => match &app.filter_stage {
             FilterStage::SelectColumn => match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    app.filter_selected_col = (app.filter_selected_col + 1) % vis_col_count;
+                    if vis_col_count > 0 {
+                        app.filter_selected_col = (app.filter_selected_col + 1) % vis_col_count;
+                    }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     app.filter_selected_col = if app.filter_selected_col == 0 {
@@ -512,6 +550,25 @@ fn apply_filter(app: &mut App) {
 /// Enter AI query mode, OR — if no API key is configured — first show the
 /// inline two-step key setup (pick provider → paste key → save), then auto-
 /// advance into AI query mode.
+/// Leave a query result and show the full base `data` table again.
+pub fn return_to_base_table(app: &mut App) {
+    match app.reset_to_base_table() {
+        Ok(()) => app.status_message = Some(format!("Back to {}", app.filename())),
+        Err(e) => app.error_message = Some(format!("Couldn't reload table: {}", e)),
+    }
+}
+
+pub fn enter_sql_mode(app: &mut App) {
+    app.mode = AppMode::SqlQuery;
+    app.sql_history_idx = None;
+    app.error_message = None;
+    // Pre-fill a working query so Enter does something useful immediately and
+    // the user discovers the table name (`data`) without guessing.
+    if app.sql_input.is_empty() {
+        app.sql_input = "SELECT * FROM data".to_string();
+    }
+}
+
 pub fn enter_ai_or_key_setup(app: &mut App) {
     let config = crate::ai::config::AiConfig::load();
     let has_any_key = config.openai_api_key.is_some() || config.anthropic_api_key.is_some();
@@ -665,6 +722,8 @@ fn handle_sql_mode(app: &mut App, key: KeyEvent) {
                 match app.engine.execute_query(&sql) {
                     Ok(result) => {
                         app.push_view_state();
+                        app.viewing_query_result = true;
+                        app.result_sql = Some(sql.clone());
                         app.columns = result.columns;
                         app.rows = result.rows;
                         app.total_rows = result.total_rows;
@@ -680,7 +739,8 @@ fn handle_sql_mode(app: &mut App, key: KeyEvent) {
                         app.mode = AppMode::Normal;
                     }
                     Err(e) => {
-                        app.error_message = Some(format!("SQL error: {}", e));
+                        app.error_message = Some(clean_sql_error(&e.to_string(), &app.data_columns));
+                        // Stay in SQL mode so the user can fix the query in place.
                     }
                 }
             }
@@ -713,6 +773,44 @@ fn handle_sql_mode(app: &mut App, key: KeyEvent) {
             app.sql_input.push(c);
         }
         _ => {}
+    }
+}
+
+/// DuckDB binder/catalog errors are verbose (they append `Candidate bindings:`
+/// and `LINE n:` noise that overflows the one-line status bar). Trim to the
+/// essential message and, for the common "wrong table/column" mistakes, point
+/// the user at the real table name and columns.
+fn clean_sql_error(raw: &str, data_columns: &[String]) -> String {
+    // Cut the trailing noise DuckDB appends.
+    let mut msg = raw;
+    for marker in ["\nLINE ", "LINE ", "\nCandidate bindings", "Candidate bindings"] {
+        if let Some(i) = msg.find(marker) {
+            msg = &msg[..i];
+        }
+    }
+    let msg = msg.trim().trim_end_matches('!').trim();
+
+    let lower = msg.to_lowercase();
+    let mentions_table = lower.contains("does not exist")
+        || lower.contains("not found in from clause")
+        || lower.contains("catalog error")
+        || lower.contains("table with name");
+
+    if mentions_table {
+        let cols = preview_columns(data_columns);
+        format!("{}  →  query the table named `data` (columns: {})", msg, cols)
+    } else {
+        format!("SQL error: {}", msg)
+    }
+}
+
+/// A short, comma-separated preview of column names for hints/errors.
+fn preview_columns(cols: &[String]) -> String {
+    const MAX: usize = 8;
+    if cols.len() > MAX {
+        format!("{}, … (+{} more)", cols[..MAX].join(", "), cols.len() - MAX)
+    } else {
+        cols.join(", ")
     }
 }
 
@@ -896,23 +994,30 @@ fn handle_export_mode(app: &mut App, key: KeyEvent) {
                 .and_then(|s| s.to_str())
                 .unwrap_or("output");
 
-            let (ext, export_fn): (&str, fn(&_, &str, _, _) -> _) = match app.export_format_idx {
-                0 => ("csv", export::export_csv),
-                1 => ("json", export::export_json),
-                2 => ("parquet", export::export_parquet),
-                _ => ("csv", export::export_csv),
+            let ext = match app.export_format_idx {
+                1 => "json",
+                2 => "parquet",
+                _ => "csv",
+            };
+            let path = format!("{}_export.{}", base_name, ext);
+
+            // Export what's on screen: the query result if one is showing,
+            // otherwise the (filtered/sorted) base table.
+            let result = if let Some(sql) = app.result_sql.clone() {
+                export::export_result(&app.engine, &path, app.export_format_idx, &sql)
+            } else {
+                let export_fn: fn(&crate::data::engine::DataEngine, &str, Option<&str>, Option<&str>) -> anyhow::Result<()> =
+                    match app.export_format_idx {
+                        1 => export::export_json,
+                        2 => export::export_parquet,
+                        _ => export::export_csv,
+                    };
+                let where_clause = app.build_where_clause();
+                let order_by = app.build_order_by();
+                export_fn(&app.engine, &path, where_clause.as_deref(), order_by.as_deref())
             };
 
-            let path = format!("{}_export.{}", base_name, ext);
-            let where_clause = app.build_where_clause();
-            let order_by = app.build_order_by();
-
-            match export_fn(
-                &app.engine,
-                &path,
-                where_clause.as_deref(),
-                order_by.as_deref(),
-            ) {
+            match result {
                 Ok(_) => {
                     app.export_path = path.clone();
                     app.status_message = Some(format!("Exported to {}", path));
@@ -937,6 +1042,9 @@ fn handle_formula_bar_mode(app: &mut App, key: KeyEvent) {
                 match app.engine.evaluate_expression(&app.formula_input) {
                     Ok(result) => {
                         app.push_view_state();
+                        app.viewing_query_result = true;
+                        app.result_sql =
+                            Some(crate::data::engine::DataEngine::expression_sql(&app.formula_input));
                         let row_count = result.total_rows;
                         app.columns = result.columns;
                         app.rows = result.rows;
@@ -999,6 +1107,7 @@ fn handle_computed_column_mode(app: &mut App, key: KeyEvent) {
                                 match app.engine.get_schema() {
                                     Ok(new_cols) => {
                                         app.columns = new_cols;
+                                        app.data_columns = app.columns.iter().map(|c| c.name.clone()).collect();
                                         app.col_widths = vec![15u16; app.columns.len()];
                                         app.hidden_cols = vec![false; app.columns.len()];
                                         app.total_rows = app.engine.get_total_rows().unwrap_or(app.total_rows);
@@ -1104,16 +1213,18 @@ fn handle_groupby_mode(app: &mut App, key: KeyEvent) {
                     let safe_agg_col = format!("\"{}\"", agg_col_name.replace('"', "\"\""));
 
                     let sql = format!(
-                        "SELECT {group_cols}, {func}({agg_col}) AS {func}_{col_name} FROM data GROUP BY {group_cols} ORDER BY {group_cols}",
+                        "SELECT {group_cols}, {func}({agg_col}) AS \"{func}_{col_name}\" FROM data GROUP BY {group_cols} ORDER BY {group_cols}",
                         group_cols = group_cols.join(", "),
                         func = agg_func,
                         agg_col = safe_agg_col,
-                        col_name = agg_col_name.replace('"', "").replace(' ', "_"),
+                        col_name = agg_col_name.replace('"', "\"\""),
                     );
 
                     match app.engine.execute_query(&sql) {
                         Ok(result) => {
                             app.push_view_state();
+                            app.viewing_query_result = true;
+                            app.result_sql = Some(sql.clone());
                             let row_count = result.total_rows;
                             app.columns = result.columns;
                             app.rows = result.rows;
@@ -1254,6 +1365,7 @@ fn handle_join_mode(app: &mut App, key: KeyEvent) {
                                     let total = app.engine.get_total_rows().unwrap_or(0);
                                     let col_count = new_cols.len();
                                     app.columns = new_cols;
+                                    app.data_columns = app.columns.iter().map(|c| c.name.clone()).collect();
                                     app.total_rows = total;
                                     app.filtered_rows = total;
                                     app.cursor_row = 0;
@@ -1302,13 +1414,13 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             ensure_cursor_visible(app);
         }
         MouseEventKind::Down(_) => {
-            // Rough click-to-select: map mouse position to row/col
-            let header_height = 3; // header (2) + table border (1)
-            if mouse.row > header_height as u16 {
-                let clicked_row = (mouse.row as usize)
-                    .saturating_sub(header_height)
-                    .saturating_sub(1) // table header row
-                    + app.scroll_offset;
+            // Map a click to a data row. Screen layout above the first data row:
+            // header (2) + filter bar (1, only when filters exist) + table top
+            // border (1) + table header (1).
+            let filter_rows = if app.filters.is_empty() { 0 } else { 1 };
+            let first_data_row = 2 + filter_rows + 1 + 1;
+            if (mouse.row as usize) >= first_data_row {
+                let clicked_row = (mouse.row as usize) - first_data_row + app.scroll_offset;
                 if clicked_row < app.filtered_rows {
                     app.cursor_row = clicked_row;
                     ensure_cursor_visible(app);
@@ -1337,6 +1449,8 @@ pub fn handle_ai_response(app: &mut App, sql: String) {
     match app.engine.execute_query(&sql) {
         Ok(result) => {
             app.push_view_state();
+            app.viewing_query_result = true;
+            app.result_sql = Some(sql.clone());
             app.columns = result.columns;
             app.rows = result.rows;
             app.total_rows = result.total_rows;
@@ -1374,11 +1488,6 @@ fn ensure_cursor_visible(app: &mut App) {
         app.scroll_offset = app.cursor_row.saturating_sub(visible_rows) + 1;
         let _ = app.refresh_data();
     }
-    // Check if we need more data
-    let row_in_page = app.cursor_row.saturating_sub(app.scroll_offset);
-    if row_in_page >= app.rows.len().saturating_sub(5) && app.rows.len() >= app.page_size {
-        let _ = app.refresh_data();
-    }
 }
 
 fn ensure_col_visible(app: &mut App) {
@@ -1399,22 +1508,43 @@ fn execute_search(app: &mut App) {
         return;
     }
 
-    let re = match regex::Regex::new(&app.search_query) {
-        Ok(r) => r,
+    // Build a valid pattern: use the query as a regex, falling back to an escaped
+    // literal if it doesn't compile (so a stray `(` still searches literally).
+    let (re, pattern) = match regex::Regex::new(&app.search_query) {
+        Ok(r) => (r, app.search_query.clone()),
         Err(_) => {
-            // Fall back to literal match
-            match regex::Regex::new(&regex::escape(&app.search_query)) {
-                Ok(r) => r,
+            let escaped = regex::escape(&app.search_query);
+            match regex::Regex::new(&escaped) {
+                Ok(r) => (r, escaped),
                 Err(_) => return,
             }
         }
     };
 
-    for (row_display_idx, row_data) in app.rows.iter().enumerate() {
-        let actual_row = app.scroll_offset + row_display_idx;
-        for (col_idx, val) in row_data.iter().enumerate() {
-            if re.is_match(val) {
-                app.search_matches.push((actual_row, col_idx));
+    if app.viewing_query_result {
+        // The result lives whole in `rows` (absolute indices), so scan it here.
+        for (row_idx, row_data) in app.rows.iter().enumerate() {
+            for (col_idx, val) in row_data.iter().enumerate() {
+                if re.is_match(val) {
+                    app.search_matches.push((row_idx, col_idx));
+                }
+            }
+        }
+    } else {
+        // Base table: only a page is loaded, so search the full table server-side.
+        let where_clause = app.build_where_clause();
+        let order_by = app.build_order_by();
+        let col_names: Vec<String> = app.columns.iter().map(|c| c.name.clone()).collect();
+        match app.engine.find_search_matches(
+            &pattern,
+            where_clause.as_deref(),
+            order_by.as_deref(),
+            &col_names,
+        ) {
+            Ok(matches) => app.search_matches = matches,
+            Err(e) => {
+                app.error_message = Some(format!("Search error: {}", e));
+                return;
             }
         }
     }
@@ -1459,4 +1589,36 @@ fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
     }
 
     anyhow::bail!("No clipboard tool available")
+}
+
+#[cfg(test)]
+mod sql_error_tests {
+    use super::{clean_sql_error, preview_columns};
+
+    #[test]
+    fn trims_binder_noise_and_points_at_data_table() {
+        let cols = vec!["product".to_string(), "category".to_string(), "price".to_string()];
+        let raw = "Binder Error: Referenced column \"category\" not found in FROM clause!Candidate bindings: \"tableowner\", \"hastriggers\"LINE 1: ...";
+        let cleaned = clean_sql_error(raw, &cols);
+
+        assert!(!cleaned.contains("Candidate bindings"), "noise leaked: {cleaned}");
+        assert!(!cleaned.contains("LINE 1"), "LINE noise leaked: {cleaned}");
+        assert!(cleaned.contains("`data`"), "missing table hint: {cleaned}");
+        assert!(cleaned.contains("product, category, price"), "missing column hint: {cleaned}");
+    }
+
+    #[test]
+    fn passes_through_non_table_errors_concisely() {
+        let cols = vec!["a".to_string()];
+        let cleaned = clean_sql_error("Parser Error: syntax error at or near \"slect\"", &cols);
+        assert!(cleaned.starts_with("SQL error:"), "got: {cleaned}");
+        assert!(!cleaned.contains("`data`"), "should not add table hint: {cleaned}");
+    }
+
+    #[test]
+    fn previews_cap_long_column_lists() {
+        let cols: Vec<String> = (0..12).map(|i| format!("c{i}")).collect();
+        let p = preview_columns(&cols);
+        assert!(p.contains("+4 more"), "got: {p}");
+    }
 }

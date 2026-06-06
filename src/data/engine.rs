@@ -137,6 +137,16 @@ impl DataEngine {
         Ok(count as usize)
     }
 
+    /// Deterministic ORDER BY expression shared by pagination, rowid lookup, and
+    /// search so a display row, its rowid, and its search ordinal all agree.
+    /// `rowid` is the tiebreaker (and sole key when there's no user sort).
+    fn order_expr(order_by: Option<&str>) -> String {
+        match order_by {
+            Some(o) if !o.is_empty() => format!("{}, rowid", o),
+            _ => "rowid".to_string(),
+        }
+    }
+
     pub fn query_page(
         &self,
         offset: usize,
@@ -163,11 +173,7 @@ impl DataEngine {
             }
         }
 
-        if let Some(o) = order_by {
-            if !o.is_empty() {
-                sql.push_str(&format!(" ORDER BY {}", o));
-            }
-        }
+        sql.push_str(&format!(" ORDER BY {}", Self::order_expr(order_by)));
 
         // Get total count with filters
         let count_sql = if let Some(w) = where_clause {
@@ -246,8 +252,16 @@ impl DataEngine {
         })
     }
 
-    pub fn get_column_stats(&self, column: &str) -> Result<Vec<(String, String)>> {
+    pub fn get_column_stats(&self, column: &str, where_clause: Option<&str>) -> Result<Vec<(String, String)>> {
         let safe_col = format!("\"{}\"", column.replace('"', "\"\""));
+        let where_sql = match where_clause {
+            Some(w) if !w.is_empty() => format!(" WHERE {}", w),
+            _ => String::new(),
+        };
+        let and_filter = match where_clause {
+            Some(w) if !w.is_empty() => format!(" AND ({})", w),
+            _ => String::new(),
+        };
         let sql = format!(
             r#"SELECT
                 COUNT(*)::VARCHAR,
@@ -256,8 +270,9 @@ impl DataEngine {
                 COUNT(DISTINCT {col})::VARCHAR,
                 MIN({col}::VARCHAR)::VARCHAR,
                 MAX({col}::VARCHAR)::VARCHAR
-            FROM data"#,
-            col = safe_col
+            FROM data{where_sql}"#,
+            col = safe_col,
+            where_sql = where_sql,
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -274,8 +289,9 @@ impl DataEngine {
 
         // Try numeric stats
         let num_sql = format!(
-            "SELECT AVG({col})::VARCHAR, MEDIAN({col})::VARCHAR, STDDEV({col})::VARCHAR FROM data WHERE TRY_CAST({col} AS DOUBLE) IS NOT NULL",
-            col = safe_col
+            "SELECT AVG({col})::VARCHAR, MEDIAN({col})::VARCHAR, STDDEV({col})::VARCHAR FROM data WHERE TRY_CAST({col} AS DOUBLE) IS NOT NULL{and_filter}",
+            col = safe_col,
+            and_filter = and_filter,
         );
         if let Ok(mut num_stmt) = self.conn.prepare(&num_sql) {
             if let Ok(num_row) = num_stmt.query_row(params![], |r| {
@@ -316,11 +332,7 @@ impl DataEngine {
             }
         }
 
-        if let Some(o) = order_by {
-            if !o.is_empty() {
-                sql.push_str(&format!(" ORDER BY {}", o));
-            }
-        }
+        sql.push_str(&format!(" ORDER BY {}", Self::order_expr(order_by)));
 
         sql.push_str(&format!(" LIMIT 1 OFFSET {}", display_offset));
 
@@ -330,6 +342,71 @@ impl DataEngine {
             .context("Failed to resolve rowid for display row")?;
 
         Ok(rowid)
+    }
+
+    /// Find every cell matching `pattern` (an RE2 regex) across the whole
+    /// filtered table — not just the loaded page. Returns `(row_ordinal,
+    /// col_idx)` pairs where `row_ordinal` is the absolute position in the same
+    /// order pagination uses, so highlights and `n`/`N` line up with the view.
+    pub fn find_search_matches(
+        &self,
+        pattern: &str,
+        where_clause: Option<&str>,
+        order_by: Option<&str>,
+        columns: &[String],
+    ) -> Result<Vec<(usize, usize)>> {
+        if columns.is_empty() || pattern.is_empty() {
+            return Ok(Vec::new());
+        }
+        let safe_pat = pattern.replace('\'', "''");
+        let flags: Vec<String> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                format!(
+                    "regexp_matches(\"{}\"::VARCHAR, '{}') AS m{}",
+                    c.replace('"', "\"\""),
+                    safe_pat,
+                    i
+                )
+            })
+            .collect();
+        let flag_names: Vec<String> = (0..columns.len()).map(|i| format!("m{}", i)).collect();
+        let where_sql = match where_clause {
+            Some(w) if !w.is_empty() => format!(" WHERE {}", w),
+            _ => String::new(),
+        };
+        let sql = format!(
+            "SELECT __rn, {sel} FROM (\
+               SELECT (ROW_NUMBER() OVER (ORDER BY {order}) - 1) AS __rn, {flags} FROM data{where_sql}\
+             ) WHERE {ors} ORDER BY __rn",
+            sel = flag_names.join(", "),
+            order = Self::order_expr(order_by),
+            flags = flags.join(", "),
+            where_sql = where_sql,
+            ors = flag_names.join(" OR "),
+        );
+
+        let ncols = columns.len();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut matches = Vec::new();
+        let rows = stmt.query_map(params![], |row| {
+            let rn: i64 = row.get(0)?;
+            let mut row_flags = Vec::with_capacity(ncols);
+            for i in 0..ncols {
+                row_flags.push(row.get::<_, Option<bool>>(i + 1)?.unwrap_or(false));
+            }
+            Ok((rn as usize, row_flags))
+        })?;
+        for r in rows {
+            let (rn, row_flags) = r?;
+            for (col_idx, hit) in row_flags.iter().enumerate() {
+                if *hit {
+                    matches.push((rn, col_idx));
+                }
+            }
+        }
+        Ok(matches)
     }
 
     pub fn update_cell(&self, rowid: i64, column: &str, new_value: &str) -> Result<()> {
@@ -346,13 +423,18 @@ impl DataEngine {
         Ok(())
     }
 
-    pub fn get_histogram_data(&self, column: &str) -> Result<(Vec<(String, usize)>, f64, f64, f64)> {
+    pub fn get_histogram_data(&self, column: &str, where_clause: Option<&str>) -> Result<(Vec<(String, usize)>, f64, f64, f64)> {
         let safe_col = format!("\"{}\"", column.replace('"', "\"\""));
+        let and_filter = match where_clause {
+            Some(w) if !w.is_empty() => format!(" AND ({})", w),
+            _ => String::new(),
+        };
 
         // Check if column is numeric
         let check_sql = format!(
-            "SELECT COUNT(*) FROM data WHERE TRY_CAST({} AS DOUBLE) IS NOT NULL",
-            safe_col
+            "SELECT COUNT(*) FROM data WHERE TRY_CAST({} AS DOUBLE) IS NOT NULL{and_filter}",
+            safe_col,
+            and_filter = and_filter,
         );
         let mut check_stmt = self.conn.prepare(&check_sql)?;
         let numeric_count: i64 = check_stmt.query_row(params![], |row| row.get(0))?;
@@ -362,8 +444,9 @@ impl DataEngine {
 
         // Get min, max, avg
         let stats_sql = format!(
-            "SELECT MIN(TRY_CAST({col} AS DOUBLE)), MAX(TRY_CAST({col} AS DOUBLE)), AVG(TRY_CAST({col} AS DOUBLE)) FROM data WHERE TRY_CAST({col} AS DOUBLE) IS NOT NULL",
-            col = safe_col
+            "SELECT MIN(TRY_CAST({col} AS DOUBLE)), MAX(TRY_CAST({col} AS DOUBLE)), AVG(TRY_CAST({col} AS DOUBLE)) FROM data WHERE TRY_CAST({col} AS DOUBLE) IS NOT NULL{and_filter}",
+            col = safe_col,
+            and_filter = and_filter,
         );
         let mut stats_stmt = self.conn.prepare(&stats_sql)?;
         let (min_val, max_val, avg_val): (f64, f64, f64) = stats_stmt.query_row(params![], |row| {
@@ -387,12 +470,13 @@ impl DataEngine {
 
         let hist_sql = format!(
             "SELECT LEAST(FLOOR((TRY_CAST({col} AS DOUBLE) - {min}) / {bw}), {max_bin})::INTEGER AS bin, COUNT(*) AS cnt \
-             FROM data WHERE TRY_CAST({col} AS DOUBLE) IS NOT NULL \
+             FROM data WHERE TRY_CAST({col} AS DOUBLE) IS NOT NULL{and_filter} \
              GROUP BY bin ORDER BY bin",
             col = safe_col,
             min = min_val,
             bw = bin_width,
             max_bin = bins - 1,
+            and_filter = and_filter,
         );
         let mut hist_stmt = self.conn.prepare(&hist_sql)?;
         let hist_rows: Vec<(i32, usize)> = hist_stmt
@@ -421,21 +505,23 @@ impl DataEngine {
         Ok((data, min_val, max_val, avg_val))
     }
 
-    pub fn evaluate_expression(&self, expr: &str) -> Result<QueryResult> {
-        let is_aggregate = {
-            let upper = expr.to_uppercase();
-            upper.contains("SUM(") || upper.contains("AVG(") || upper.contains("COUNT(")
-                || upper.contains("MIN(") || upper.contains("MAX(")
-                || upper.contains("MEDIAN(") || upper.contains("STDDEV(")
-        };
+    /// The SQL a formula-bar expression expands to. Exposed so callers can
+    /// record it (e.g. for Export) alongside running it.
+    pub fn expression_sql(expr: &str) -> String {
+        let upper = expr.to_uppercase();
+        let is_aggregate = upper.contains("SUM(") || upper.contains("AVG(") || upper.contains("COUNT(")
+            || upper.contains("MIN(") || upper.contains("MAX(")
+            || upper.contains("MEDIAN(") || upper.contains("STDDEV(");
 
-        let sql = if is_aggregate {
+        if is_aggregate {
             format!("SELECT {} AS result FROM data", expr)
         } else {
             format!("SELECT *, ({}) AS result FROM data", expr)
-        };
+        }
+    }
 
-        self.execute_query(&sql)
+    pub fn evaluate_expression(&self, expr: &str) -> Result<QueryResult> {
+        self.execute_query(&Self::expression_sql(expr))
     }
 
     pub fn add_computed_column(&self, name: &str, expr: &str) -> Result<()> {
@@ -522,12 +608,37 @@ impl DataEngine {
     pub fn execute_join(&self, join_type: &str, col1: &str, col2: &str) -> Result<()> {
         let safe_col1 = col1.replace('"', "\"\"");
         let safe_col2 = col2.replace('"', "\"\"");
+
+        // `SELECT data.*, data2.*` errors (or yields ambiguous columns) whenever
+        // the two files share a column name — which the join key always does if
+        // both sides name it the same. Build the projection explicitly and
+        // suffix any overlapping right-side column with `_2`.
+        let left_cols = self.get_schema()?;
+        let right_cols = self.get_table_schema("data2")?;
+        let left_names: Vec<String> = left_cols.iter().map(|c| c.name.clone()).collect();
+
+        let mut select_parts: Vec<String> = left_cols
+            .iter()
+            .map(|c| format!("data.\"{}\"", c.name.replace('"', "\"\"")))
+            .collect();
+        for c in &right_cols {
+            let safe = c.name.replace('"', "\"\"");
+            if left_names.contains(&c.name) {
+                let alias = format!("{}_2", c.name).replace('"', "\"\"");
+                select_parts.push(format!("data2.\"{}\" AS \"{}\"", safe, alias));
+            } else {
+                select_parts.push(format!("data2.\"{}\"", safe));
+            }
+        }
+
         let sql = format!(
             "CREATE OR REPLACE TABLE data AS \
-             SELECT data.*, data2.* \
+             SELECT {} \
              FROM data {join_type} JOIN data2 \
              ON data.\"{}\" = data2.\"{}\"",
-            safe_col1, safe_col2,
+            select_parts.join(", "),
+            safe_col1,
+            safe_col2,
             join_type = join_type,
         );
         self.conn.execute_batch(&sql)
@@ -549,5 +660,100 @@ impl DataEngine {
             .filter_map(|r| r.ok())
             .collect();
         Ok(values)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stat(stats: &[(String, String)], key: &str) -> String {
+        stats.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap()
+    }
+
+    #[test]
+    fn search_finds_matches_beyond_the_first_page() {
+        let engine = DataEngine::new().unwrap();
+        // 200 rows — well past the 100-row page size.
+        engine
+            .execute_raw("CREATE TABLE data AS SELECT i AS id, ('row' || i) AS label FROM range(0, 200) t(i)")
+            .unwrap();
+        let cols = vec!["id".to_string(), "label".to_string()];
+
+        let matches = engine
+            .find_search_matches("^row150$", None, None, &cols)
+            .unwrap();
+        // Row ordinal 150 (rowid order), column index 1 (label).
+        assert_eq!(matches, vec![(150, 1)]);
+    }
+
+    #[test]
+    fn search_respects_active_filter() {
+        let engine = DataEngine::new().unwrap();
+        engine
+            .execute_raw("CREATE TABLE data AS SELECT i AS id, ('row' || i) AS label FROM range(0, 10) t(i)")
+            .unwrap();
+        let cols = vec!["id".to_string(), "label".to_string()];
+
+        // With a filter excluding id>=5, 'row7' must not be found.
+        let matches = engine
+            .find_search_matches("row7", Some("\"id\" < 5"), None, &cols)
+            .unwrap();
+        assert!(matches.is_empty(), "filtered-out row should not match: {matches:?}");
+    }
+
+    #[test]
+    fn column_stats_respect_filter() {
+        let engine = DataEngine::new().unwrap();
+        engine
+            .execute_raw("CREATE TABLE data AS SELECT i AS id, (i % 2) AS grp FROM range(0, 100) t(i)")
+            .unwrap();
+
+        let all = engine.get_column_stats("id", None).unwrap();
+        assert_eq!(stat(&all, "Total"), "100");
+
+        let filtered = engine.get_column_stats("id", Some("\"grp\" = 0")).unwrap();
+        assert_eq!(stat(&filtered, "Total"), "50");
+    }
+
+    #[test]
+    fn export_result_writes_the_query_not_the_base_table() {
+        let engine = DataEngine::new().unwrap();
+        engine
+            .execute_raw("CREATE TABLE data AS SELECT i AS id FROM range(0, 5) t(i)")
+            .unwrap();
+        let path = std::env::temp_dir().join("xeli_export_result_test.csv");
+        let p = path.to_str().unwrap();
+
+        // Trailing semicolon must be tolerated when wrapping in COPY(...).
+        crate::data::export::export_result(&engine, p, 0, "SELECT id FROM data WHERE id < 3;").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], "id");
+        assert_eq!(lines.len(), 4, "header + 3 filtered rows, got {lines:?}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn join_dedups_overlapping_column_names() {
+        let engine = DataEngine::new().unwrap();
+        engine
+            .execute_raw("CREATE TABLE data AS SELECT i AS id, ('L' || i) AS name FROM range(0, 3) t(i)")
+            .unwrap();
+        engine
+            .execute_raw("CREATE TABLE data2 AS SELECT i AS id, ('R' || i) AS name FROM range(0, 3) t(i)")
+            .unwrap();
+
+        // Before the fix this errored with duplicate column names.
+        engine.execute_join("INNER", "id", "id").unwrap();
+        let names: Vec<String> = engine.get_schema().unwrap().iter().map(|c| c.name.clone()).collect();
+
+        let mut deduped = names.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), names.len(), "duplicate column names: {names:?}");
+        assert!(names.contains(&"id_2".to_string()), "missing suffixed key: {names:?}");
+        assert!(names.contains(&"name_2".to_string()), "missing suffixed col: {names:?}");
     }
 }

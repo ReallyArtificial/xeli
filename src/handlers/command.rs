@@ -3,6 +3,16 @@ use crate::event::AppEvent;
 use tokio::sync::mpsc;
 
 pub fn execute_command(app: &mut App, command_name: &str, _ai_tx: &mpsc::UnboundedSender<AppEvent>) {
+    // Structural commands are defined over the base `data` table; if a query
+    // result is showing, snap back first (mirrors the keyboard handler).
+    const STRUCTURAL: &[&str] = &[
+        "Sort", "Filter", "Clear Filters", "Group By", "Join",
+        "Formula Bar", "Computed Column", "Sparkline", "Column Stats",
+    ];
+    if app.viewing_query_result && STRUCTURAL.contains(&command_name) {
+        crate::handlers::input::return_to_base_table(app);
+    }
+
     match command_name {
         "Search" => {
             app.mode = AppMode::Search;
@@ -43,12 +53,14 @@ pub fn execute_command(app: &mut App, command_name: &str, _ai_tx: &mpsc::Unbound
                 let _ = app.refresh_data();
             }
         }
+        "Back to Table" => {
+            crate::handlers::input::return_to_base_table(app);
+        }
         "AI Query" => {
             crate::handlers::input::enter_ai_or_key_setup(app);
         }
         "SQL Query" => {
-            app.mode = AppMode::SqlQuery;
-            app.sql_input.clear();
+            crate::handlers::input::enter_sql_mode(app);
         }
         "Export" => {
             app.mode = AppMode::Export;
@@ -58,7 +70,7 @@ pub fn execute_command(app: &mut App, command_name: &str, _ai_tx: &mpsc::Unbound
         "Column Stats" => {
             let vis_cols = app.visible_columns();
             if let Some((_, col)) = vis_cols.get(app.cursor_col) {
-                match app.engine.get_column_stats(&col.name) {
+                match app.engine.get_column_stats(&col.name, app.build_where_clause().as_deref()) {
                     Ok(stats) => {
                         app.stats_data = stats;
                         app.mode = AppMode::ColumnStats;
@@ -120,7 +132,7 @@ pub fn execute_command(app: &mut App, command_name: &str, _ai_tx: &mpsc::Unbound
         "Sparkline" => {
             let vis_cols = app.visible_columns();
             if let Some((_, col)) = vis_cols.get(app.cursor_col) {
-                match app.engine.get_histogram_data(&col.name) {
+                match app.engine.get_histogram_data(&col.name, app.build_where_clause().as_deref()) {
                     Ok((data, min, max, avg)) => {
                         app.sparkline_data = data;
                         app.sparkline_min = min;

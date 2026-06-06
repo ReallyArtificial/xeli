@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
                 // No arg, no pipe — open the file picker in the current directory.
                 let files = loader::list_data_files_in_cwd().unwrap_or_default();
                 if files.is_empty() {
-                    eprintln!("No supported data files in this directory.");
+                    eprintln!("No supported data files found here (searched this folder and subfolders).");
                     eprintln!("Usage:  xeli <file>");
                     eprintln!("        cat data.csv | xeli");
                     std::process::exit(1);
