@@ -8,6 +8,7 @@ pub fn execute_command(app: &mut App, command_name: &str, _ai_tx: &mpsc::Unbound
     const STRUCTURAL: &[&str] = &[
         "Sort", "Filter", "Clear Filters", "Group By", "Join",
         "Formula Bar", "Computed Column", "Sparkline", "Column Stats",
+        "Add Row", "Add Column", "Board View",
     ];
     if app.viewing_query_result && STRUCTURAL.contains(&command_name) {
         crate::handlers::input::return_to_base_table(app);
@@ -149,6 +150,21 @@ pub fn execute_command(app: &mut App, command_name: &str, _ai_tx: &mpsc::Unbound
         "Formula Bar" => {
             app.mode = AppMode::FormulaBar;
             app.formula_input.clear();
+        }
+        "Add Row" => {
+            crate::handlers::input::add_row(app);
+        }
+        "Add Column" => {
+            crate::handlers::input::start_new_column(app);
+        }
+        "Delete Row" => {
+            crate::handlers::input::delete_row(app);
+        }
+        "Board View" => {
+            crate::handlers::input::toggle_board(app);
+        }
+        "Save" => {
+            crate::handlers::input::save_table(app);
         }
         "Computed Column" => {
             app.computed_col_stage = ComputedColumnStage::EnterName;

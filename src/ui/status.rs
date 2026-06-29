@@ -67,6 +67,9 @@ fn mode_badge(mode: &AppMode, colors: &ThemeColors) -> Span<'static> {
         AppMode::ColumnStats => (" STATS ", colors.accent),
         AppMode::Export => (" EXPORT ", colors.accent),
         AppMode::Help => (" HELP ", colors.accent),
+        AppMode::NewColumn => (" +COLUMN ", colors.green),
+        AppMode::SelectCell => (" SELECT ", colors.pink),
+        AppMode::Board => (" BOARD ", colors.purple),
     };
     Span::styled(
         label,
@@ -93,7 +96,7 @@ fn key_hints(app: &App) -> String {
             " Viewing query result · Esc or u: back to full table · e export · / find · t theme · q quit ".to_string()
         }
         AppMode::Normal => {
-            " Ctrl+K AI · Ctrl+Q SQL · / find · f filter · s sort · g group · J join · = formula · e export · t theme · ? help · q quit ".to_string()
+            " Ctrl+K AI · o +row · a +col · Space/Enter set · b board · Ctrl+S save · / find · f filter · s sort · e export · ? help · q quit ".to_string()
         }
         AppMode::Search => " Type to search (regex)  Enter:confirm  n/N:next/prev  Esc:cancel ".to_string(),
         AppMode::Filter => " Build filter step-by-step  Enter:next  Tab:next field  Esc:cancel ".to_string(),
@@ -131,5 +134,8 @@ fn key_hints(app: &App) -> String {
             JoinStage::SelectJoinType => " j/k:type  Enter:next  Esc:cancel ".to_string(),
             JoinStage::SelectColumns => " Tab:switch side  j/k:pick column  Enter:join  Esc:cancel ".to_string(),
         },
+        AppMode::NewColumn => " Name → type → values · Enter:next · Shift+Tab:back · Esc:cancel ".to_string(),
+        AppMode::SelectCell => " Type to filter · ↑↓ move · Enter:set · Esc:cancel ".to_string(),
+        AppMode::Board => " ←→ lane · ↑↓ card · Enter:open row · v/b:back to table ".to_string(),
     }
 }

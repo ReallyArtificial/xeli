@@ -30,11 +30,21 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, colors: &ThemeColors) {
                 .fg(colors.fg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!("\u{2502} {}r \u{00D7} {}c ", app.filtered_rows, app.columns.len()),
-            Style::default().fg(colors.muted),
-        ),
     ];
+
+    // Unsaved-changes dot — plain text is the source of truth, so make "you have
+    // edits not on disk" impossible to miss (and trivial to act on: Ctrl+S).
+    if app.dirty {
+        spans1.push(Span::styled(
+            "\u{25CF} ",
+            Style::default().fg(colors.warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    spans1.push(Span::styled(
+        format!("\u{2502} {}r \u{00D7} {}c ", app.filtered_rows, app.columns.len()),
+        Style::default().fg(colors.muted),
+    ));
 
     // Sort indicator
     if let Some(sort_col) = app.sort_column {

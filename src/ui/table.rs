@@ -151,7 +151,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, colors: &ThemeColors) {
             }
 
             // Data cells
-            for (vi, (actual_idx, _)) in vis_cols.iter().enumerate() {
+            for (vi, (actual_idx, col)) in vis_cols.iter().enumerate() {
                 if vi < visible_range_start || vi >= visible_range_end {
                     continue;
                 }
@@ -210,15 +210,20 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, colors: &ThemeColors) {
                         Span::styled(display_after, edit_style),
                     ])));
                 } else {
-                    let display_value = if value.chars().count() > max_width.saturating_sub(2) {
-                        let truncated: String = value.chars().take(max_width.saturating_sub(3)).collect();
-                        format!(" {}\u{2026}", truncated)
-                    } else {
-                        format!(" {}", value)
-                    };
+                    let col_type = app.col_type_of(&col.name);
+                    let is_blank = value == "NULL" || value.is_empty();
 
-                    let style = if is_cursor {
-                        // Active cell: bright accent bg, dark text, bold
+                    // A Select value renders as a colored pill — the typed status
+                    // column reads at a glance, no conditional-formatting needed.
+                    let pill = col_type.and_then(|t| {
+                        if is_blank {
+                            None
+                        } else {
+                            t.select_value(value)
+                        }
+                    });
+
+                    let base_style = if is_cursor {
                         Style::default()
                             .fg(colors.cursor_fg)
                             .bg(colors.cursor_bg)
@@ -228,17 +233,60 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, colors: &ThemeColors) {
                             .fg(colors.bg)
                             .bg(colors.search_match)
                             .add_modifier(Modifier::BOLD)
-                    } else if value == "NULL" {
-                        // NULL values: dim and muted
-                        Style::default()
-                            .fg(colors.muted)
-                            .bg(row_bg)
-                            .add_modifier(Modifier::DIM)
                     } else {
                         Style::default().fg(row_fg).bg(row_bg)
                     };
 
-                    cells.push(Cell::from(Span::styled(display_value, style)));
+                    if let Some(sv) = pill {
+                        // Dot in the value's color + label; on the cursor cell the
+                        // cursor bg wins but the dot keeps its hue.
+                        let dot_color = crate::ui::theme::pill_color(sv.color);
+                        let label: String = {
+                            let avail = max_width.saturating_sub(4);
+                            if sv.label.chars().count() > avail {
+                                let t: String = sv.label.chars().take(avail.saturating_sub(1)).collect();
+                                format!("{}\u{2026}", t)
+                            } else {
+                                sv.label.clone()
+                            }
+                        };
+                        cells.push(Cell::from(Line::from(vec![
+                            Span::styled(" ● ", base_style.fg(dot_color)),
+                            Span::styled(label, base_style),
+                        ])));
+                    } else if is_blank {
+                        // Blank/NULL: a faint placeholder instead of the word NULL,
+                        // so a fresh tracker reads as an empty grid, not noise.
+                        cells.push(Cell::from(Span::styled(
+                            " ·",
+                            if is_cursor {
+                                base_style
+                            } else {
+                                Style::default().fg(colors.muted).bg(row_bg).add_modifier(Modifier::DIM)
+                            },
+                        )));
+                    } else {
+                        // Checkboxes for Bool columns; plain text otherwise.
+                        let rendered = match col_type {
+                            Some(crate::data::schema::ColumnType::Bool) => {
+                                match value.to_lowercase().as_str() {
+                                    "true" | "1" | "yes" | "y" | "x" | "✓" => " ☑".to_string(),
+                                    "false" | "0" | "no" | "n" => " ☐".to_string(),
+                                    _ => format!(" {}", value),
+                                }
+                            }
+                            _ => {
+                                if value.chars().count() > max_width.saturating_sub(2) {
+                                    let truncated: String =
+                                        value.chars().take(max_width.saturating_sub(3)).collect();
+                                    format!(" {}\u{2026}", truncated)
+                                } else {
+                                    format!(" {}", value)
+                                }
+                            }
+                        };
+                        cells.push(Cell::from(Span::styled(rendered, base_style)));
+                    }
                 }
             }
 

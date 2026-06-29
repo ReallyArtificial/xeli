@@ -1,6 +1,6 @@
 [package]
 name = "xeli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Excel for the Terminal — interactive TUI spreadsheet with AI-powered queries"
 license = "MIT"
@@ -35,6 +35,9 @@ dirs = "6"
 toml = "0.8"
 unicode-width = "0.2"
 regex = "1"
+
+# xlsx export with real data-validation dropdowns
+rust_xlsxwriter = "0.79"
 
 [profile.release]
 opt-level = "z"

@@ -1,5 +1,6 @@
 use crate::data::engine::{ColumnInfo, DataEngine};
 use crate::data::loader::FileFormat;
+use crate::data::schema::{ColumnType, SelectValue, TableSchema};
 use anyhow::Result;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +22,22 @@ pub enum AppMode {
     ComputedColumn,
     GroupBy,
     Join,
+    /// Add a new typed column (name → type → values).
+    NewColumn,
+    /// Pick a value for a Select cell from its dropdown.
+    SelectCell,
+    /// Kanban board grouped by a Select column.
+    Board,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NewColumnStage {
+    EnterName,
+    PickType,
+    /// Only for Select columns: choose a ready-made value set.
+    PickPreset,
+    /// Only for Select columns: type a custom comma-separated value set.
+    EnterValues,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -235,6 +252,33 @@ pub struct App {
     pub ai_key_stage: AiKeyStage,
     pub ai_key_provider_idx: usize, // 0 = Anthropic, 1 = OpenAI
     pub ai_key_input: String,
+
+    // --- Create / typed-column feature ---
+    /// The semantic types of the current table's columns, when known (created
+    /// tables, or files with a `*.xeli.json` sidecar). Drives pills, the select
+    /// dropdown, type-aware sorting, and xlsx dropdown export. `None` = a plain
+    /// untyped table (fully backwards-compatible).
+    pub schema: Option<TableSchema>,
+    /// Set once the table has unsaved edits, so the title can show a `●` and
+    /// quit can nudge. Created tables start dirty (nothing on disk yet).
+    pub dirty: bool,
+
+    // New-column wizard
+    pub new_col_stage: NewColumnStage,
+    pub new_col_name: String,
+    pub new_col_type_idx: usize,
+    pub new_col_preset_idx: usize,
+    pub new_col_values_input: String,
+
+    // Select-cell dropdown
+    pub select_options: Vec<SelectValue>,
+    pub select_cursor: usize,
+    pub select_filter: String,
+
+    // Board (kanban) view
+    pub board_group_col: Option<usize>,
+    pub board_lane_cursor: usize,
+    pub board_card_cursor: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -374,6 +418,20 @@ impl App {
             ai_key_stage: AiKeyStage::PickProvider,
             ai_key_provider_idx: 0,
             ai_key_input: String::new(),
+
+            schema: None,
+            dirty: false,
+            new_col_stage: NewColumnStage::EnterName,
+            new_col_name: String::new(),
+            new_col_type_idx: 0,
+            new_col_preset_idx: 0,
+            new_col_values_input: String::new(),
+            select_options: Vec::new(),
+            select_cursor: 0,
+            select_filter: String::new(),
+            board_group_col: None,
+            board_lane_cursor: 0,
+            board_card_cursor: 0,
         };
 
         app.refresh_data()?;
@@ -433,15 +491,58 @@ impl App {
                         SortDirection::Desc => "DESC",
                         SortDirection::None => unreachable!(),
                     };
-                    return Some(format!(
-                        "\"{}\" {}",
-                        col.name.replace('"', "\"\""),
-                        dir_str
-                    ));
+                    let safe = col.name.replace('"', "\"\"");
+                    // Numeric typed columns are stored as VARCHAR, so order by a
+                    // numeric cast (NULLs/garbage fall to the end) instead of
+                    // comparing "100" < "9" lexicographically.
+                    let expr = match self.col_type_of(&col.name) {
+                        Some(t) if t.is_numeric() => {
+                            format!("TRY_CAST(\"{}\" AS DOUBLE) {} NULLS LAST", safe, dir_str)
+                        }
+                        _ => format!("\"{}\" {}", safe, dir_str),
+                    };
+                    return Some(expr);
                 }
             }
         }
         None
+    }
+
+    /// The semantic type of a column by name, if a schema is loaded.
+    pub fn col_type_of(&self, name: &str) -> Option<&ColumnType> {
+        self.schema.as_ref().and_then(|s| s.col_type(name))
+    }
+
+    /// The visible column the cursor is on (actual index, name, type).
+    pub fn current_column_name(&self) -> Option<String> {
+        self.visible_columns()
+            .get(self.cursor_col)
+            .map(|(_, c)| c.name.clone())
+    }
+
+    pub fn current_column_type(&self) -> Option<ColumnType> {
+        let name = self.current_column_name()?;
+        self.col_type_of(&name).cloned()
+    }
+
+    /// Select-cell options narrowed by the live filter (subsequence match).
+    pub fn select_filtered_options(&self) -> Vec<SelectValue> {
+        if self.select_filter.is_empty() {
+            return self.select_options.clone();
+        }
+        let q = self.select_filter.to_lowercase();
+        self.select_options
+            .iter()
+            .filter(|v| v.label.to_lowercase().contains(&q))
+            .cloned()
+            .collect()
+    }
+
+    /// First Select column index (visible position) — the board's default lane source.
+    pub fn first_select_col(&self) -> Option<usize> {
+        self.visible_columns()
+            .iter()
+            .position(|(_, c)| matches!(self.col_type_of(&c.name), Some(ColumnType::Select { .. })))
     }
 
     pub fn build_where_clause(&self) -> Option<String> {

@@ -2,15 +2,31 @@ use crate::ai::config::AiConfig;
 use anyhow::{bail, Result};
 use serde_json::json;
 
+const SQL_SYSTEM: &str =
+    "You are a SQL query generator. Output ONLY valid DuckDB SQL. No markdown, no explanation.";
+
+const SCHEMA_SYSTEM: &str =
+    "You design spreadsheet/tracker schemas. Output ONLY a JSON object. No markdown, no prose.";
+
+/// Natural-language → SQL (the AI bar).
 pub async fn query_ai(config: &AiConfig, prompt: &str) -> Result<String> {
+    query_with_system(config, SQL_SYSTEM, prompt).await
+}
+
+/// Natural-language → table schema JSON (the create flow).
+pub async fn query_schema(config: &AiConfig, prompt: &str) -> Result<String> {
+    query_with_system(config, SCHEMA_SYSTEM, prompt).await
+}
+
+async fn query_with_system(config: &AiConfig, system: &str, prompt: &str) -> Result<String> {
     match config.provider.as_str() {
-        "openai" => query_openai(config, prompt).await,
-        "anthropic" => query_anthropic(config, prompt).await,
+        "openai" => query_openai(config, system, prompt).await,
+        "anthropic" => query_anthropic(config, system, prompt).await,
         _ => bail!("Unknown AI provider: {}", config.provider),
     }
 }
 
-async fn query_openai(config: &AiConfig, prompt: &str) -> Result<String> {
+async fn query_openai(config: &AiConfig, system: &str, prompt: &str) -> Result<String> {
     let api_key = config
         .openai_api_key
         .as_ref()
@@ -31,7 +47,7 @@ async fn query_openai(config: &AiConfig, prompt: &str) -> Result<String> {
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a SQL query generator. Output ONLY valid DuckDB SQL. No markdown, no explanation."
+                    "content": system
                 },
                 {
                     "role": "user",
@@ -39,7 +55,7 @@ async fn query_openai(config: &AiConfig, prompt: &str) -> Result<String> {
                 }
             ],
             "temperature": 0.0,
-            "max_tokens": 500
+            "max_tokens": 700
         }))
         .send()
         .await?;
@@ -59,7 +75,7 @@ async fn query_openai(config: &AiConfig, prompt: &str) -> Result<String> {
     Ok(sql)
 }
 
-async fn query_anthropic(config: &AiConfig, prompt: &str) -> Result<String> {
+async fn query_anthropic(config: &AiConfig, system: &str, prompt: &str) -> Result<String> {
     let api_key = config
         .anthropic_api_key
         .as_ref()
@@ -78,8 +94,8 @@ async fn query_anthropic(config: &AiConfig, prompt: &str) -> Result<String> {
         .header("Content-Type", "application/json")
         .json(&json!({
             "model": model,
-            "max_tokens": 500,
-            "system": "You are a SQL query generator. Output ONLY valid DuckDB SQL. No markdown, no explanation.",
+            "max_tokens": 700,
+            "system": system,
             "messages": [
                 {
                     "role": "user",

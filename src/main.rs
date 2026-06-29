@@ -52,6 +52,21 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Create a new spreadsheet — interactive, or from a template / column spec / AI
+    New {
+        /// Template key: tasks, issues, content, okrs, crm, expenses, quick, blank.
+        /// Omit for the interactive picker.
+        template: Option<String>,
+        /// Define columns inline, e.g. "title status:select(Todo,Doing,Done) due:date"
+        #[arg(short, long)]
+        columns: Option<String>,
+        /// Let AI design the columns from a description
+        #[arg(short, long)]
+        ai: Option<String>,
+        /// Output file name (default derived from the template)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -76,12 +91,7 @@ enum ConfigAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Handle config subcommands
-    if let Some(Commands::Config { action }) = cli.command {
-        return handle_config(action);
-    }
-
-    // Resolve theme up front (used by picker too)
+    // Resolve theme up front (used by picker / create screen too)
     let theme = match cli.theme.as_str() {
         "nord" => app::Theme::Nord,
         "catppuccin" => app::Theme::Catppuccin,
@@ -89,6 +99,20 @@ async fn main() -> Result<()> {
         "solarized" => app::Theme::Solarized,
         _ => app::Theme::Dracula,
     };
+
+    // Subcommands
+    match cli.command {
+        Some(Commands::Config { action }) => return handle_config(action),
+        Some(Commands::New {
+            template,
+            columns,
+            ai,
+            output,
+        }) => {
+            return run_new_command(template, columns, ai, output, theme, cli.no_row_numbers).await;
+        }
+        None => {}
+    }
 
     // Determine file path: CLI arg → stdin pipe → file picker in cwd.
     let file_path: String = match cli.file {
@@ -106,19 +130,20 @@ async fn main() -> Result<()> {
                 }
             } else {
                 // No arg, no pipe — open the file picker in the current directory.
+                // With no data files at all, jump straight to creating one.
                 let files = loader::list_data_files_in_cwd().unwrap_or_default();
                 if files.is_empty() {
-                    eprintln!("No supported data files found here (searched this folder and subfolders).");
-                    eprintln!("Usage:  xeli <file>");
-                    eprintln!("        cat data.csv | xeli");
-                    std::process::exit(1);
+                    return run_new_command(None, None, None, None, theme, cli.no_row_numbers).await;
                 }
                 match run_file_picker(files, &theme)? {
-                    Some(path) => path.to_string_lossy().to_string(),
-                    None => {
-                        // User cancelled.
-                        return Ok(());
+                    Some(ui::file_picker::PickOutcome::Open(path)) => {
+                        path.to_string_lossy().to_string()
                     }
+                    Some(ui::file_picker::PickOutcome::Create) => {
+                        return run_new_command(None, None, None, None, theme, cli.no_row_numbers)
+                            .await;
+                    }
+                    None => return Ok(()), // user cancelled
                 }
             }
         }
@@ -141,7 +166,13 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to load {}", file_path))?;
 
     // Create app state
-    let mut app = App::new(file_path, format, engine)?;
+    let mut app = App::new(file_path.clone(), format, engine)?;
+
+    // A `*.xeli.json` sidecar restores typed columns (pills, dropdowns, dates).
+    if let Some(schema) = data::schema::TableSchema::load_sidecar(&file_path) {
+        app.schema = Some(schema);
+        app.auto_size_columns();
+    }
 
     // Apply CLI options
     app.theme = theme;
@@ -149,7 +180,12 @@ async fn main() -> Result<()> {
         app.show_row_numbers = false;
     }
 
-    // Setup terminal
+    launch_app(app).await
+}
+
+/// Terminal setup → event loop → teardown. Shared by the open-file and
+/// create-new paths.
+async fn launch_app(mut app: App) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -157,10 +193,8 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    // Run event loop
     let result = run_app(&mut terminal, &mut app).await;
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -173,14 +207,128 @@ async fn main() -> Result<()> {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
-
     Ok(())
+}
+
+/// Resolve a create request (template / DSL / AI / interactive) into a schema +
+/// filename, then build the in-memory table and launch the app on it.
+async fn run_new_command(
+    template: Option<String>,
+    columns: Option<String>,
+    ai: Option<String>,
+    output: Option<String>,
+    theme: app::Theme,
+    no_row_numbers: bool,
+) -> Result<()> {
+    use data::schema::TableSchema;
+
+    let (schema, filename) = if let Some(cols) = columns {
+        let schema = TableSchema::from_dsl(&cols);
+        if schema.columns.is_empty() {
+            eprintln!("No columns parsed from --columns. Example:");
+            eprintln!("  xeli new --columns \"title status:select(Todo,Doing,Done) due:date\"");
+            std::process::exit(1);
+        }
+        (schema, output.unwrap_or_else(|| "table.csv".to_string()))
+    } else if let Some(desc) = ai {
+        eprintln!("✨ Designing your table with AI…");
+        let schema = ai_generate_schema(&desc).await?;
+        (schema, output.unwrap_or_else(|| "table.csv".to_string()))
+    } else if let Some(tpl) = template {
+        match data::templates::by_key(&tpl) {
+            Some(schema) => {
+                let fname = data::templates::all()
+                    .into_iter()
+                    .find(|t| t.key == tpl)
+                    .map(|t| t.filename.to_string())
+                    .unwrap_or_else(|| "table.csv".to_string());
+                (schema, output.unwrap_or(fname))
+            }
+            None => {
+                eprintln!(
+                    "Unknown template '{}'.  Try: tasks, issues, content, okrs, crm, expenses, quick, blank",
+                    tpl
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Interactive create screen.
+        match run_create_screen(&theme)? {
+            ui::create::CreateChoice::Schema(schema, fname) => (schema, output.unwrap_or(fname)),
+            ui::create::CreateChoice::Ai(desc) => {
+                eprintln!("✨ Designing your table with AI…");
+                let schema = ai_generate_schema(&desc).await?;
+                (schema, output.unwrap_or_else(|| "table.csv".to_string()))
+            }
+            ui::create::CreateChoice::Cancel => return Ok(()),
+        }
+    };
+
+    launch_new_table(schema, filename, theme, no_row_numbers).await
+}
+
+async fn launch_new_table(
+    schema: data::schema::TableSchema,
+    filename: String,
+    theme: app::Theme,
+    no_row_numbers: bool,
+) -> Result<()> {
+    let engine = DataEngine::new()?;
+    engine
+        .create_table_from_schema(&schema, 5)
+        .context("Failed to create the new table")?;
+
+    let format = loader::detect_format(&filename).unwrap_or(loader::FileFormat::Csv);
+    let mut app = App::new(filename.clone(), format, engine)?;
+    app.schema = Some(schema);
+    app.theme = theme;
+    app.dirty = true;
+    if no_row_numbers {
+        app.show_row_numbers = false;
+    }
+    app.auto_size_columns();
+    app.status_message = Some(format!(
+        "New table — press Ctrl+S to save {}",
+        app.filename()
+    ));
+    launch_app(app).await
+}
+
+async fn ai_generate_schema(description: &str) -> Result<data::schema::TableSchema> {
+    let config = ai::config::AiConfig::load();
+    if config.openai_api_key.is_none() && config.anthropic_api_key.is_none() {
+        anyhow::bail!(
+            "AI needs an API key. Set ANTHROPIC_API_KEY / OPENAI_API_KEY, or run: xeli config set-key anthropic <key>"
+        );
+    }
+    let prompt = ai::prompt::build_schema_prompt(description);
+    let raw = ai::client::query_schema(&config, &prompt)
+        .await
+        .context("AI request failed")?;
+    data::schema::from_ai_json(&raw).context("Couldn't parse the schema the AI returned")
+}
+
+fn run_create_screen(theme: &app::Theme) -> Result<ui::create::CreateChoice> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let result = ui::create::run(&mut terminal, theme);
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
 }
 
 fn run_file_picker(
     files: Vec<std::path::PathBuf>,
     theme: &app::Theme,
-) -> Result<Option<std::path::PathBuf>> {
+) -> Result<Option<ui::file_picker::PickOutcome>> {
     // Standalone TUI session — must set up and tear down independently of the
     // main app so a pick-then-quit path leaves the terminal clean.
     enable_raw_mode()?;

@@ -55,18 +55,27 @@ fn fuzzy_contains(haystack: &str, needle: &str) -> bool {
     true
 }
 
-/// Run a small TUI to pick one of the listed data files. Returns the chosen
-/// path, or Ok(None) if the user cancels with Esc/q.
+/// What the user chose in the picker.
+pub enum PickOutcome {
+    Open(PathBuf),
+    Create,
+}
+
+/// Run a small TUI to pick a data file — or create a new one. The first row is
+/// always "Create a new table"; the rest are the discovered files. Returns
+/// Ok(None) if the user cancels with Esc/q.
 pub fn pick(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     files: Vec<PathBuf>,
     theme: &Theme,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<PickOutcome>> {
     let mut state = PickerState {
         all_files: files,
         root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         query: String::new(),
-        cursor: 0,
+        // Row 0 is "Create new"; default the highlight to the first file so Enter
+        // still opens (the create affordance sits one step up).
+        cursor: 1,
         colors: get_theme_colors(theme),
     };
 
@@ -79,45 +88,44 @@ pub fn pick(
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                let len = state.filtered().len();
+                // Total rows = the create row (index 0) + the filtered files.
+                let len = state.filtered().len() + 1;
+                let reset_cursor = |s: &PickerState| if s.filtered().is_empty() { 0 } else { 1 };
                 match (key.modifiers, key.code) {
                     (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(None),
                     (_, KeyCode::Esc) => return Ok(None),
                     (_, KeyCode::Enter) => {
+                        if state.cursor == 0 {
+                            return Ok(Some(PickOutcome::Create));
+                        }
                         let filtered = state.filtered();
-                        if let Some(pick) = filtered.get(state.cursor) {
-                            return Ok(Some((*pick).clone()));
+                        if let Some(pick) = filtered.get(state.cursor - 1) {
+                            return Ok(Some(PickOutcome::Open((*pick).clone())));
                         }
                     }
                     // Up / Ctrl+P — wrap to bottom from the top.
                     (_, KeyCode::Up) | (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
-                        if len > 0 {
-                            state.cursor = if state.cursor == 0 { len - 1 } else { state.cursor - 1 };
-                        }
+                        state.cursor = if state.cursor == 0 { len - 1 } else { state.cursor - 1 };
                     }
                     // Down / Ctrl+N — wrap to top from the bottom.
                     (_, KeyCode::Down) | (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
-                        if len > 0 {
-                            state.cursor = if state.cursor + 1 >= len { 0 } else { state.cursor + 1 };
-                        }
+                        state.cursor = if state.cursor + 1 >= len { 0 } else { state.cursor + 1 };
                     }
                     (_, KeyCode::PageUp) => {
                         state.cursor = state.cursor.saturating_sub(page);
                     }
                     (_, KeyCode::PageDown) => {
-                        if len > 0 {
-                            state.cursor = (state.cursor + page).min(len - 1);
-                        }
+                        state.cursor = (state.cursor + page).min(len - 1);
                     }
                     (_, KeyCode::Home) => state.cursor = 0,
                     (_, KeyCode::End) => state.cursor = len.saturating_sub(1),
                     (_, KeyCode::Backspace) => {
                         state.query.pop();
-                        state.cursor = 0;
+                        state.cursor = reset_cursor(&state);
                     }
                     (_, KeyCode::Char(c)) => {
                         state.query.push(c);
-                        state.cursor = 0;
+                        state.cursor = reset_cursor(&state);
                     }
                     _ => {}
                 }
@@ -184,33 +192,53 @@ fn draw(f: &mut Frame, state: &PickerState) -> usize {
     ));
     f.render_widget(Paragraph::new(sep), chunks[1]);
 
-    // File list
-    let max_items = chunks[2].height as usize;
+    // File list — row 0 is always "Create a new table", pinned at the top.
+    let total_height = chunks[2].height as usize;
     let mut lines: Vec<Line> = Vec::new();
 
-    if filtered.is_empty() {
-        let msg = if state.all_files.is_empty() {
-            "No supported data files here.  Try: xeli path/to/file.csv"
-        } else {
-            "No matches"
-        };
-        lines.push(Line::from(Span::styled(
-            format!("  {}", msg),
-            Style::default().fg(state.colors.muted),
-        )));
+    let create_cursor = state.cursor == 0;
+    let create_style = if create_cursor {
+        Style::default()
+            .fg(state.colors.cursor_fg)
+            .bg(state.colors.cursor_bg)
+            .add_modifier(Modifier::BOLD)
     } else {
-        // Center the cursor in the window where possible, clamped to the ends.
-        let start = if filtered.len() <= max_items {
+        Style::default().fg(state.colors.accent2).add_modifier(Modifier::BOLD)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(if create_cursor { " ▸ " } else { "   " }, create_style),
+        Span::styled("✦ Create a new table…", create_style),
+        Span::styled(
+            "  template · AI · blank",
+            if create_cursor {
+                Style::default().fg(state.colors.cursor_fg).bg(state.colors.cursor_bg)
+            } else {
+                Style::default().fg(state.colors.muted)
+            },
+        ),
+    ]));
+
+    let file_area = total_height.saturating_sub(1);
+    if filtered.is_empty() {
+        if !state.query.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No matching files",
+                Style::default().fg(state.colors.muted),
+            )));
+        }
+    } else if file_area > 0 {
+        // Center the file cursor in the window where possible, clamped to ends.
+        let file_cursor = state.cursor.saturating_sub(1);
+        let start = if filtered.len() <= file_area {
             0
         } else {
-            state
-                .cursor
-                .saturating_sub(max_items / 2)
-                .min(filtered.len() - max_items)
+            file_cursor
+                .saturating_sub(file_area / 2)
+                .min(filtered.len() - file_area)
         };
-        for (offset, path) in filtered.iter().skip(start).take(max_items).enumerate() {
+        for (offset, path) in filtered.iter().skip(start).take(file_area).enumerate() {
             let idx = start + offset;
-            let is_cursor = idx == state.cursor;
+            let is_cursor = state.cursor == idx + 1;
             let name = state.display_path(path);
             let ext = path
                 .extension()
@@ -253,10 +281,10 @@ fn draw(f: &mut Frame, state: &PickerState) -> usize {
     f.render_widget(Paragraph::new(lines), chunks[2]);
 
     // Footer hints + position
-    let pos = if filtered.is_empty() {
-        String::new()
+    let pos = if state.cursor == 0 {
+        "new  ".to_string()
     } else {
-        format!("{}/{}  ", state.cursor + 1, filtered.len())
+        format!("{}/{}  ", state.cursor, filtered.len())
     };
     let footer = Line::from(vec![
         Span::styled(
@@ -270,7 +298,7 @@ fn draw(f: &mut Frame, state: &PickerState) -> usize {
     ]);
     f.render_widget(Paragraph::new(footer), chunks[3]);
 
-    max_items
+    file_area.max(1)
 }
 
 /// Compact "time since modified" label, e.g. `2h`, `3d`, `5mo`. Keeps the picker

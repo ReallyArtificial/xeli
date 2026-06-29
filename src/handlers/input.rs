@@ -1,5 +1,6 @@
-use crate::app::{App, AiKeyStage, AppMode, CellEditRecord, ComputedColumnStage, Filter, FilterStage, GroupByStage, JoinStage, SortDirection};
+use crate::app::{App, AiKeyStage, AppMode, CellEditRecord, ComputedColumnStage, Filter, FilterStage, GroupByStage, JoinStage, NewColumnStage, SortDirection};
 use crate::data::export;
+use crate::data::schema::{select_from_labels, ColumnSpec, ColumnType, TableSchema};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 use crate::event::AppEvent;
@@ -35,6 +36,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, ai_tx: &mpsc::UnboundedSender<Ap
         AppMode::ComputedColumn => handle_computed_column_mode(app, key),
         AppMode::GroupBy => handle_groupby_mode(app, key),
         AppMode::Join => handle_join_mode(app, key),
+        AppMode::NewColumn => handle_new_column_mode(app, key),
+        AppMode::SelectCell => handle_select_cell_mode(app, key),
+        AppMode::Board => handle_board_mode(app, key),
     }
 }
 
@@ -59,6 +63,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSend
                 | (_, KeyCode::Char('='))
                 | (_, KeyCode::Char('J'))
                 | (_, KeyCode::Char('v'))
+                | (_, KeyCode::Char('o'))
+                | (_, KeyCode::Char('a'))
+                | (_, KeyCode::Char('b'))
                 | (KeyModifiers::CONTROL, KeyCode::Char('i'))
         );
         if is_structural {
@@ -78,6 +85,10 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSend
         }
         (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
             enter_sql_mode(app);
+        }
+        // Save to disk (plain-text CSV + the typed schema sidecar)
+        (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
+            save_table(app);
         }
 
         // Quit
@@ -245,9 +256,34 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSend
             app.status_message = Some("Filters cleared".to_string());
         }
 
-        // Cell detail
+        // Cell detail — but on a Select cell, Enter opens the value dropdown.
         (_, KeyCode::Enter) => {
-            app.mode = AppMode::CellDetail;
+            if !open_select_dropdown(app) {
+                app.mode = AppMode::CellDetail;
+            }
+        }
+
+        // Space cycles a Select cell to its next value, in place — the fastest
+        // possible status change.
+        (_, KeyCode::Char(' ')) => {
+            cycle_select_value(app);
+        }
+
+        // Add a blank row (vim-ish "open below")
+        (_, KeyCode::Char('o')) => {
+            add_row(app);
+        }
+        // Add a new typed column (name → type → values)
+        (_, KeyCode::Char('a')) => {
+            start_new_column(app);
+        }
+        // Delete the current row
+        (KeyModifiers::SHIFT, KeyCode::Char('D')) => {
+            delete_row(app);
+        }
+        // Board (kanban) view, grouped by a Select column
+        (_, KeyCode::Char('b')) => {
+            toggle_board(app);
         }
 
         // Column stats
@@ -335,19 +371,22 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent, _ai_tx: &mpsc::UnboundedSend
                 Some("Can't edit a query result — press Esc to return to the table".to_string());
         }
         (_, KeyCode::Char('i')) => {
-            let value = app
-                .current_cell_value()
-                .unwrap_or("NULL")
-                .to_string();
-            let value = if value == "NULL" {
-                String::new()
-            } else {
-                value
-            };
-            app.edit_original = value.clone();
-            app.edit_buffer = value;
-            app.edit_cursor_pos = app.edit_buffer.len();
-            app.mode = AppMode::CellEdit;
+            // A Select column edits through its dropdown, not free text.
+            if !open_select_dropdown(app) {
+                let value = app
+                    .current_cell_value()
+                    .unwrap_or("NULL")
+                    .to_string();
+                let value = if value == "NULL" {
+                    String::new()
+                } else {
+                    value
+                };
+                app.edit_original = value.clone();
+                app.edit_buffer = value;
+                app.edit_cursor_pos = app.edit_buffer.len();
+                app.mode = AppMode::CellEdit;
+            }
         }
 
         // Undo (also the way out of a query result)
@@ -890,6 +929,7 @@ fn handle_cell_edit_mode(app: &mut App, key: KeyEvent) {
                                     old_value: app.edit_original.clone(),
                                     new_value,
                                 });
+                                app.dirty = true;
                                 let _ = app.refresh_data();
                                 app.status_message = Some("Cell updated".to_string());
                             }
@@ -983,10 +1023,10 @@ fn handle_export_mode(app: &mut App, key: KeyEvent) {
             app.mode = AppMode::Normal;
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            app.export_format_idx = (app.export_format_idx + 1) % 3;
+            app.export_format_idx = (app.export_format_idx + 1) % 4;
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            app.export_format_idx = if app.export_format_idx == 0 { 2 } else { app.export_format_idx - 1 };
+            app.export_format_idx = if app.export_format_idx == 0 { 3 } else { app.export_format_idx - 1 };
         }
         KeyCode::Enter => {
             let base_name = std::path::Path::new(&app.file_path)
@@ -997,13 +1037,15 @@ fn handle_export_mode(app: &mut App, key: KeyEvent) {
             let ext = match app.export_format_idx {
                 1 => "json",
                 2 => "parquet",
+                3 => "xlsx",
                 _ => "csv",
             };
             let path = format!("{}_export.{}", base_name, ext);
 
-            // Export what's on screen: the query result if one is showing,
-            // otherwise the (filtered/sorted) base table.
-            let result = if let Some(sql) = app.result_sql.clone() {
+            // xlsx materializes Select columns as real clickable dropdowns.
+            let result = if app.export_format_idx == 3 {
+                export::export_xlsx(&app.engine, &path, app.schema.as_ref())
+            } else if let Some(sql) = app.result_sql.clone() {
                 export::export_result(&app.engine, &path, app.export_format_idx, &sql)
             } else {
                 let export_fn: fn(&crate::data::engine::DataEngine, &str, Option<&str>, Option<&str>) -> anyhow::Result<()> =
@@ -1398,6 +1440,479 @@ fn handle_join_mode(app: &mut App, key: KeyEvent) {
                 _ => {}
             },
         },
+    }
+}
+
+// --- Create / typed-column feature ------------------------------------------
+
+/// Ensure `app.schema` exists, inferring untyped columns as Text so the first
+/// typed column can be added to a previously-plain table.
+fn ensure_schema(app: &mut App) {
+    if app.schema.is_none() {
+        let cols = app
+            .columns
+            .iter()
+            .map(|c| ColumnSpec {
+                name: c.name.clone(),
+                col_type: ColumnType::Text,
+            })
+            .collect();
+        app.schema = Some(TableSchema::new(cols));
+    }
+}
+
+/// Re-read the engine's column list after a structural change (add/seed column).
+fn reload_columns(app: &mut App) {
+    if let Ok(cols) = app.engine.get_schema() {
+        let n = cols.len();
+        app.columns = cols;
+        app.data_columns = app.columns.iter().map(|c| c.name.clone()).collect();
+        app.col_widths = vec![15u16; n];
+        app.hidden_cols = vec![false; n];
+        app.total_rows = app.engine.get_total_rows().unwrap_or(app.total_rows);
+        let _ = app.refresh_data();
+        app.auto_size_columns();
+    }
+}
+
+/// Write the table back to disk as plain-text data (in its own format) plus the
+/// `*.xeli.json` schema sidecar — the dual artifact that keeps the file a
+/// first-class citizen of git while preserving the typed/dropdown semantics.
+pub fn save_table(app: &mut App) {
+    if app.viewing_query_result {
+        return_to_base_table(app);
+    }
+    let path = app.file_path.clone();
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("csv")
+        .to_lowercase();
+
+    // rowid order keeps the serialization deterministic → small, reviewable diffs.
+    let order = Some("rowid");
+    let result = match ext.as_str() {
+        "json" | "jsonl" | "ndjson" => export::export_json(&app.engine, &path, None, order),
+        "parquet" | "pq" => export::export_parquet(&app.engine, &path, None, order),
+        _ => export::export_csv(&app.engine, &path, None, order),
+    };
+
+    match result {
+        Ok(_) => {
+            let mut msg = format!("Saved {}", app.filename());
+            if let Some(schema) = &app.schema {
+                if let Ok(side) = schema.save_sidecar(&path) {
+                    if let Some(name) = side.file_name().and_then(|n| n.to_str()) {
+                        msg = format!("Saved {} + {}", app.filename(), name);
+                    }
+                }
+            }
+            app.dirty = false;
+            app.status_message = Some(msg);
+        }
+        Err(e) => app.error_message = Some(format!("Save error: {}", e)),
+    }
+}
+
+/// Open the value dropdown if the cursor is on a Select cell. Returns true if it
+/// did, so callers can fall back to their default behavior otherwise.
+fn open_select_dropdown(app: &mut App) -> bool {
+    if app.viewing_query_result {
+        return false;
+    }
+    if let Some(ColumnType::Select { values, .. }) = app.current_column_type() {
+        if values.is_empty() {
+            return false;
+        }
+        let current = app.current_cell_value().unwrap_or("").to_string();
+        app.select_cursor = values.iter().position(|v| v.label == current).unwrap_or(0);
+        app.select_options = values;
+        app.select_filter.clear();
+        app.mode = AppMode::SelectCell;
+        return true;
+    }
+    false
+}
+
+/// Write a value into the current cell via its rowid (shared by the dropdown and
+/// the Space-to-cycle shortcut).
+fn commit_cell_value(app: &mut App, value: &str) {
+    let col_name = match app.current_column_name() {
+        Some(n) => n,
+        None => return,
+    };
+    let order_by = app.build_order_by();
+    let where_clause = app.build_where_clause();
+    match app
+        .engine
+        .get_rowid(app.cursor_row, order_by.as_deref(), where_clause.as_deref())
+    {
+        Ok(rowid) => match app.engine.update_cell(rowid, &col_name, value) {
+            Ok(_) => {
+                app.dirty = true;
+                let _ = app.refresh_data();
+                app.status_message = Some(format!("{} → {}", col_name, value));
+            }
+            Err(e) => app.error_message = Some(format!("Edit error: {}", e)),
+        },
+        Err(e) => app.error_message = Some(format!("Row lookup error: {}", e)),
+    }
+}
+
+/// Cycle a Select cell to the next value in its set, in place.
+fn cycle_select_value(app: &mut App) {
+    if app.viewing_query_result {
+        return;
+    }
+    if let Some(ColumnType::Select { values, .. }) = app.current_column_type() {
+        if values.is_empty() {
+            return;
+        }
+        let current = app.current_cell_value().unwrap_or("").to_string();
+        let next_idx = values
+            .iter()
+            .position(|v| v.label == current)
+            .map(|i| (i + 1) % values.len())
+            .unwrap_or(0);
+        let next = values[next_idx].label.clone();
+        commit_cell_value(app, &next);
+    }
+}
+
+pub fn add_row(app: &mut App) {
+    ensure_schema(app);
+    let schema = app.schema.clone().unwrap();
+    match app.engine.insert_blank_row(&schema) {
+        Ok(_) => {
+            app.total_rows = app.engine.get_total_rows().unwrap_or(app.total_rows);
+            app.dirty = true;
+            let _ = app.refresh_data();
+            if app.filtered_rows > 0 {
+                app.cursor_row = app.filtered_rows - 1;
+                ensure_cursor_visible(app);
+            }
+            app.status_message = Some("Row added — start typing".to_string());
+        }
+        Err(e) => app.error_message = Some(format!("Add row error: {}", e)),
+    }
+}
+
+pub fn delete_row(app: &mut App) {
+    if app.viewing_query_result || app.filtered_rows == 0 {
+        return;
+    }
+    let order_by = app.build_order_by();
+    let where_clause = app.build_where_clause();
+    match app
+        .engine
+        .delete_row_at(app.cursor_row, order_by.as_deref(), where_clause.as_deref())
+    {
+        Ok(_) => {
+            app.total_rows = app.engine.get_total_rows().unwrap_or(0);
+            app.dirty = true;
+            let _ = app.refresh_data();
+            if app.cursor_row >= app.filtered_rows {
+                app.cursor_row = app.filtered_rows.saturating_sub(1);
+            }
+            ensure_cursor_visible(app);
+            app.status_message = Some("Row deleted".to_string());
+        }
+        Err(e) => app.error_message = Some(format!("Delete error: {}", e)),
+    }
+}
+
+pub fn start_new_column(app: &mut App) {
+    app.new_col_stage = NewColumnStage::EnterName;
+    app.new_col_name.clear();
+    app.new_col_type_idx = 0;
+    app.new_col_preset_idx = 0;
+    app.new_col_values_input.clear();
+    app.mode = AppMode::NewColumn;
+}
+
+/// Create the column the wizard has been building and return to the grid.
+fn create_column(app: &mut App, col_type: ColumnType) {
+    let name = app.new_col_name.trim().to_string();
+    if name.is_empty() {
+        app.error_message = Some("Column needs a name".to_string());
+        return;
+    }
+    if app.columns.iter().any(|c| c.name == name) {
+        app.error_message = Some(format!("Column '{}' already exists", name));
+        return;
+    }
+    let spec = ColumnSpec {
+        name: name.clone(),
+        col_type,
+    };
+    match app.engine.add_typed_column(&spec) {
+        Ok(_) => {
+            ensure_schema(app);
+            if let Some(schema) = app.schema.as_mut() {
+                schema.columns.push(spec);
+            }
+            reload_columns(app);
+            app.dirty = true;
+            // Land the cursor on the freshly-added (right-most) column.
+            let n = app.visible_columns().len();
+            app.cursor_col = n.saturating_sub(1);
+            ensure_col_visible(app);
+            app.status_message = Some(format!("Added column '{}'", name));
+            app.mode = AppMode::Normal;
+        }
+        Err(e) => app.error_message = Some(format!("Add column error: {}", e)),
+    }
+}
+
+pub fn toggle_board(app: &mut App) {
+    if app.mode == AppMode::Board {
+        app.mode = AppMode::Normal;
+        return;
+    }
+    match app.first_select_col() {
+        Some(i) => {
+            app.board_group_col = Some(i);
+            app.board_lane_cursor = 0;
+            app.board_card_cursor = 0;
+            app.mode = AppMode::Board;
+        }
+        None => {
+            app.status_message =
+                Some("Board needs a Select column — add one with 'a'".to_string());
+        }
+    }
+}
+
+fn handle_new_column_mode(app: &mut App, key: KeyEvent) {
+    if key.code == KeyCode::Esc {
+        app.mode = AppMode::Normal;
+        return;
+    }
+    let types = ColumnType::pickable();
+    match &app.new_col_stage {
+        NewColumnStage::EnterName => match key.code {
+            KeyCode::Enter | KeyCode::Tab => {
+                if !app.new_col_name.trim().is_empty() {
+                    app.new_col_stage = NewColumnStage::PickType;
+                    app.new_col_type_idx = 0;
+                }
+            }
+            KeyCode::Backspace => {
+                app.new_col_name.pop();
+            }
+            KeyCode::Char(c) => app.new_col_name.push(c),
+            _ => {}
+        },
+        NewColumnStage::PickType => match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.new_col_type_idx = (app.new_col_type_idx + 1) % types.len();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.new_col_type_idx = if app.new_col_type_idx == 0 {
+                    types.len() - 1
+                } else {
+                    app.new_col_type_idx - 1
+                };
+            }
+            KeyCode::BackTab => {
+                app.new_col_stage = NewColumnStage::EnterName;
+            }
+            KeyCode::Enter => {
+                let chosen = types[app.new_col_type_idx].clone();
+                if matches!(chosen, ColumnType::Select { .. }) {
+                    app.new_col_stage = NewColumnStage::PickPreset;
+                    app.new_col_preset_idx = 0;
+                } else {
+                    create_column(app, chosen);
+                }
+            }
+            _ => {}
+        },
+        NewColumnStage::PickPreset => {
+            let presets = crate::data::templates::status_presets();
+            let custom_idx = presets.len();
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.new_col_preset_idx = (app.new_col_preset_idx + 1) % (custom_idx + 1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.new_col_preset_idx = if app.new_col_preset_idx == 0 {
+                        custom_idx
+                    } else {
+                        app.new_col_preset_idx - 1
+                    };
+                }
+                KeyCode::BackTab => {
+                    app.new_col_stage = NewColumnStage::PickType;
+                }
+                KeyCode::Enter => {
+                    if app.new_col_preset_idx == custom_idx {
+                        app.new_col_stage = NewColumnStage::EnterValues;
+                        app.new_col_values_input.clear();
+                    } else {
+                        let ct = presets[app.new_col_preset_idx].1.clone();
+                        create_column(app, ct);
+                    }
+                }
+                _ => {}
+            }
+        }
+        NewColumnStage::EnterValues => match key.code {
+            KeyCode::BackTab => {
+                app.new_col_stage = NewColumnStage::PickPreset;
+            }
+            KeyCode::Backspace => {
+                app.new_col_values_input.pop();
+            }
+            KeyCode::Char(c) => app.new_col_values_input.push(c),
+            KeyCode::Enter => {
+                let labels: Vec<&str> = app
+                    .new_col_values_input
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if labels.is_empty() {
+                    app.error_message = Some("Enter at least one value".to_string());
+                } else {
+                    let ct = select_from_labels(&labels);
+                    create_column(app, ct);
+                }
+            }
+            _ => {}
+        },
+    }
+}
+
+fn handle_select_cell_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+            app.select_filter.clear();
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            let len = app.select_filtered_options().len().max(1);
+            app.select_cursor = if app.select_cursor == 0 {
+                len - 1
+            } else {
+                app.select_cursor - 1
+            };
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            let len = app.select_filtered_options().len().max(1);
+            app.select_cursor = (app.select_cursor + 1) % len;
+        }
+        KeyCode::Enter => {
+            let chosen = app
+                .select_filtered_options()
+                .get(app.select_cursor)
+                .map(|v| v.label.clone());
+            if let Some(value) = chosen {
+                commit_cell_value(app, &value);
+            }
+            app.mode = AppMode::Normal;
+            app.select_filter.clear();
+        }
+        KeyCode::Backspace => {
+            app.select_filter.pop();
+            app.select_cursor = 0;
+        }
+        KeyCode::Char(c) => {
+            app.select_filter.push(c);
+            app.select_cursor = 0;
+        }
+        _ => {}
+    }
+}
+
+fn handle_board_mode(app: &mut App, key: KeyEvent) {
+    // Lane/card counts depend on the current grouping; recompute from state.
+    let (lane_labels, lane_actual) = board_lanes(app);
+    let n_lanes = lane_labels.len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('v') | KeyCode::Char('q') => {
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if n_lanes > 0 {
+                app.board_lane_cursor = if app.board_lane_cursor == 0 {
+                    n_lanes - 1
+                } else {
+                    app.board_lane_cursor - 1
+                };
+                app.board_card_cursor = 0;
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if n_lanes > 0 {
+                app.board_lane_cursor = (app.board_lane_cursor + 1) % n_lanes;
+                app.board_card_cursor = 0;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let count = board_card_count(app, lane_actual, &lane_labels);
+            if count > 0 {
+                app.board_card_cursor = (app.board_card_cursor + 1) % count;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            let count = board_card_count(app, lane_actual, &lane_labels);
+            if count > 0 {
+                app.board_card_cursor = if app.board_card_cursor == 0 {
+                    count - 1
+                } else {
+                    app.board_card_cursor - 1
+                };
+            }
+        }
+        KeyCode::Enter => {
+            // Jump to the selected card's row in the table.
+            if let Some(lane) = lane_labels.get(app.board_lane_cursor) {
+                let mut seen = 0;
+                for (idx, r) in app.rows.iter().enumerate() {
+                    if r.get(lane_actual).map(|s| s.as_str()) == Some(lane.as_str()) {
+                        if seen == app.board_card_cursor {
+                            app.cursor_row = app.scroll_offset + idx;
+                            break;
+                        }
+                        seen += 1;
+                    }
+                }
+            }
+            app.mode = AppMode::Normal;
+            ensure_cursor_visible(app);
+        }
+        _ => {}
+    }
+}
+
+/// The current board's lane labels and the actual column index they group on.
+fn board_lanes(app: &App) -> (Vec<String>, usize) {
+    let group_idx = match app.board_group_col {
+        Some(i) => i,
+        None => return (Vec::new(), 0),
+    };
+    let vis = app.visible_columns();
+    let (actual, col) = match vis.get(group_idx) {
+        Some((a, c)) => (*a, (*c).clone()),
+        None => return (Vec::new(), 0),
+    };
+    match app.col_type_of(&col.name) {
+        Some(ColumnType::Select { values, .. }) => {
+            (values.iter().map(|v| v.label.clone()).collect(), actual)
+        }
+        _ => (Vec::new(), actual),
+    }
+}
+
+fn board_card_count(app: &App, lane_actual: usize, lanes: &[String]) -> usize {
+    match lanes.get(app.board_lane_cursor) {
+        Some(lane) => app
+            .rows
+            .iter()
+            .filter(|r| r.get(lane_actual).map(|s| s.as_str()) == Some(lane.as_str()))
+            .count(),
+        None => 0,
     }
 }
 

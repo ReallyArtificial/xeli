@@ -1,5 +1,23 @@
 use crate::app::Theme;
+use crate::data::schema::PillColor;
 use ratatui::style::Color;
+
+/// Resolve a select value's `PillColor` to a concrete terminal color. Kept off
+/// the per-theme structs because the pill palette is shared across themes (the
+/// meaning — green = done, red = critical — should read the same everywhere).
+pub fn pill_color(p: PillColor) -> Color {
+    match p {
+        PillColor::Grey => Color::Indexed(245),   // #8a8a8a
+        PillColor::Blue => Color::Indexed(111),    // #87afff
+        PillColor::Green => Color::Indexed(114),   // #87d75f
+        PillColor::Yellow => Color::Indexed(222),  // #ffd787
+        PillColor::Orange => Color::Indexed(215),  // #ffaf5f
+        PillColor::Red => Color::Indexed(210),     // #ff8787
+        PillColor::Purple => Color::Indexed(141),  // #af87ff
+        PillColor::Pink => Color::Indexed(212),    // #ff87d7
+        PillColor::Cyan => Color::Indexed(116),    // #87d7d7
+    }
+}
 
 // Uses Color::Indexed (256-color palette) for universal terminal compatibility.
 //

@@ -661,6 +661,137 @@ impl DataEngine {
             .collect();
         Ok(values)
     }
+
+    // --- Table creation from a typed schema ---------------------------------
+    //
+    // Created tables are stored as plain VARCHAR columns: editing never hits a
+    // cast error and the file stays as texty as a CSV. The semantic types live
+    // in the `TableSchema` sidecar, not in DuckDB.
+
+    /// Create the base `data` table from a schema and seed it with blank rows so
+    /// the user lands on a ready-to-fill grid (select columns get their default,
+    /// which is why a fresh tracker shows status pills immediately).
+    pub fn create_table_from_schema(
+        &self,
+        schema: &crate::data::schema::TableSchema,
+        seed_rows: usize,
+    ) -> Result<()> {
+        let _ = self.conn.execute_batch("DROP TABLE IF EXISTS data");
+
+        let cols: Vec<String> = schema
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\" VARCHAR", c.name.replace('"', "\"\"")))
+            .collect();
+        if cols.is_empty() {
+            anyhow::bail!("a table needs at least one column");
+        }
+        let ddl = format!("CREATE TABLE data ({})", cols.join(", "));
+        self.conn
+            .execute_batch(&ddl)
+            .context("Failed to create table")?;
+
+        for _ in 0..seed_rows {
+            self.insert_blank_row(schema)?;
+        }
+        Ok(())
+    }
+
+    /// Insert one blank row: select columns get their default value, everything
+    /// else is NULL (rendered as an empty cell).
+    pub fn insert_blank_row(&self, schema: &crate::data::schema::TableSchema) -> Result<()> {
+        let names: Vec<String> = schema
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
+            .collect();
+        let values: Vec<String> = schema
+            .columns
+            .iter()
+            .map(|c| match c.col_type.default_value() {
+                Some(v) => format!("'{}'", v.replace('\'', "''")),
+                None => "NULL".to_string(),
+            })
+            .collect();
+        let sql = format!(
+            "INSERT INTO data ({}) VALUES ({})",
+            names.join(", "),
+            values.join(", ")
+        );
+        self.conn
+            .execute_batch(&sql)
+            .context("Failed to add row")?;
+        Ok(())
+    }
+
+    /// Add a new column to `data`. If it's a Select column with a default, every
+    /// existing row is back-filled with that default so the column isn't a wall
+    /// of blanks the moment it appears.
+    pub fn add_typed_column(
+        &self,
+        spec: &crate::data::schema::ColumnSpec,
+    ) -> Result<()> {
+        let safe = spec.name.replace('"', "\"\"");
+        self.conn
+            .execute_batch(&format!("ALTER TABLE data ADD COLUMN \"{}\" VARCHAR", safe))
+            .with_context(|| format!("Failed to add column '{}'", spec.name))?;
+
+        if let Some(default) = spec.col_type.default_value() {
+            self.conn
+                .execute_batch(&format!(
+                    "UPDATE data SET \"{}\" = '{}'",
+                    safe,
+                    default.replace('\'', "''")
+                ))
+                .ok();
+        }
+        Ok(())
+    }
+
+    /// Delete the row at a display offset (resolved through the same ordering as
+    /// pagination so the cursor row is the row that goes).
+    pub fn delete_row_at(
+        &self,
+        display_offset: usize,
+        order_by: Option<&str>,
+        where_clause: Option<&str>,
+    ) -> Result<()> {
+        let rowid = self.get_rowid(display_offset, order_by, where_clause)?;
+        self.conn
+            .execute("DELETE FROM data WHERE rowid = ?", params![rowid])
+            .context("Failed to delete row")?;
+        Ok(())
+    }
+
+    /// Every row of `data` as strings, in rowid order — used by xlsx export where
+    /// we need the whole table, not a page.
+    pub fn all_rows_as_strings(&self) -> Result<(Vec<ColumnInfo>, Vec<Vec<String>>)> {
+        let columns = self.get_schema()?;
+        let select_cols: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                let safe = c.name.replace('"', "\"\"");
+                format!("\"{}\"::VARCHAR AS \"{}\"", safe, safe)
+            })
+            .collect();
+        let sql = format!(
+            "SELECT {} FROM data ORDER BY rowid",
+            select_cols.join(", ")
+        );
+        let col_count = columns.len();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows: Vec<Vec<String>> = stmt
+            .query_map(params![], |row| {
+                let mut values = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    values.push(read_cell(row, i));
+                }
+                Ok(values)
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok((columns, rows))
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +864,64 @@ mod tests {
         assert_eq!(lines[0], "id");
         assert_eq!(lines.len(), 4, "header + 3 filtered rows, got {lines:?}");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn create_seed_add_delete_and_export_roundtrip() {
+        use crate::data::schema::{self, ColumnSpec, ColumnType, TableSchema};
+
+        let engine = DataEngine::new().unwrap();
+        let schema = TableSchema::new(vec![
+            ColumnSpec { name: "task".into(), col_type: ColumnType::Text },
+            ColumnSpec {
+                name: "status".into(),
+                col_type: schema::select_from_labels(&["Todo", "Doing", "Done"]),
+            },
+        ]);
+
+        // Create + seed 3 blank rows; the select default fills in.
+        engine.create_table_from_schema(&schema, 3).unwrap();
+        assert_eq!(engine.get_total_rows().unwrap(), 3);
+        let cols: Vec<String> = engine.get_schema().unwrap().iter().map(|c| c.name.clone()).collect();
+        assert_eq!(cols, vec!["task", "status"]);
+
+        // Seeded rows carry the select default so the grid shows pills immediately.
+        let (_c, rows) = engine.all_rows_as_strings().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r[1] == "Todo"), "default status not seeded: {rows:?}");
+        assert!(rows.iter().all(|r| r[0] == "NULL"), "non-default col should be NULL: {rows:?}");
+
+        // Add a row, then a typed column (back-filled with its default).
+        engine.insert_blank_row(&schema).unwrap();
+        assert_eq!(engine.get_total_rows().unwrap(), 4);
+        let prio = ColumnSpec { name: "priority".into(), col_type: schema::select_from_labels(&["Low", "High"]) };
+        engine.add_typed_column(&prio).unwrap();
+        let (_c2, rows2) = engine.all_rows_as_strings().unwrap();
+        assert!(rows2.iter().all(|r| r[2] == "Low"), "new column not back-filled: {rows2:?}");
+
+        // Delete one row.
+        engine.delete_row_at(0, None, None).unwrap();
+        assert_eq!(engine.get_total_rows().unwrap(), 3);
+
+        // CSV export is plain text with the right header.
+        let dir = std::env::temp_dir().join("xeli_create_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("t.csv");
+        crate::data::export::export_csv(&engine, csv.to_str().unwrap(), None, Some("rowid")).unwrap();
+        let content = std::fs::read_to_string(&csv).unwrap();
+        assert_eq!(content.lines().next().unwrap(), "task,status,priority");
+        assert_eq!(content.lines().count(), 4, "header + 3 rows");
+
+        // xlsx export with dropdowns produces a real (zip) workbook.
+        let mut full = schema.clone();
+        full.columns.push(prio);
+        let xlsx = dir.join("t.xlsx");
+        crate::data::export::export_xlsx(&engine, xlsx.to_str().unwrap(), Some(&full)).unwrap();
+        let bytes = std::fs::read(&xlsx).unwrap();
+        assert!(bytes.len() > 100, "xlsx should be non-trivial");
+        assert_eq!(&bytes[0..2], b"PK", "xlsx should be a zip archive");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

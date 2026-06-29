@@ -4,6 +4,23 @@ All notable changes to xeli are documented here. Format follows [Keep a Changelo
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-29
+
+### Added
+- **Create new spreadsheets — end to end.** xeli can now make a tracker from scratch, not just open existing files.
+  - `xeli new` opens an interactive create screen with a live, typed-column preview (status pills and all) before you commit; press `Ctrl+K` there to let AI design the table.
+  - `xeli new <template>` scaffolds one of seven canonical trackers — `tasks`, `issues`, `content`, `okrs`, `crm`, `expenses`, `quick` — plus `blank`.
+  - `xeli new --columns "title status:select(Todo,Doing,Done)=Todo due:date"` builds a schema from a Rails-style `name:type` mini-DSL (scriptable, CI-friendly).
+  - `xeli new --ai "bug tracker for a mobile app with severity and OS"` has the AI design the typed columns.
+  - The file picker grows a "✦ Create a new table" row, and an empty folder jumps straight to create.
+- **Typed columns, with the status dropdown as the centerpiece.** Columns now carry a semantic type — Text, Number, Currency, Date, Checkbox, Person, Link, and **Select** (a status/enum column that owns its value set, colors, and default). Making one is a single decision (`a` → name → type → preset/custom), not the spreadsheet ritual of free-text column + validation rule + color rules.
+  - `Enter`/`i` on a status cell opens a filterable dropdown; `Space` cycles it to the next value in place.
+  - Select values render as colored pills, booleans as checkboxes, blanks as empty cells (not `NULL`); numeric columns sort numerically.
+  - `b` opens a **kanban board** grouped by a status column; `Enter` on a card jumps to its row.
+  - `o` adds a row, `Shift+D` deletes one, `a` adds a typed column (back-filling existing rows with the default).
+- **Plain-text source of truth + schema sidecar.** `Ctrl+S` writes the data as plain CSV/JSON/Parquet **plus** a small, git-diffable `*.xeli.json` sidecar that carries the column types, value sets, colors, and defaults. Reopening a file restores the typed editing experience. An unsaved-changes dot (`●`) shows in the header.
+- **Excel export with real dropdowns.** Export (`e`) adds an `.xlsx` option that materializes Select columns as genuine, clickable data-validation dropdowns — the offline hand-off for non-terminal teammates.
+
 ## [0.2.0] — 2026-06-07
 
 ### Added
