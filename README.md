@@ -2,11 +2,13 @@
 
 **Excel for the terminal.** An interactive TUI spreadsheet with natural language queries.
 
-[![release](https://img.shields.io/github/v/release/josharsh/xeli?color=cba6f7)](https://github.com/josharsh/xeli/releases/latest)
+A [Really Artificial](https://www.reallyartificial.org/work/xeli/) project.
+
+[![release](https://img.shields.io/github/v/release/ReallyArtificial/xeli?color=cba6f7)](https://github.com/ReallyArtificial/xeli/releases/latest)
 [![npm](https://img.shields.io/npm/v/%40josharsh%2Fxeli?color=a6e3a1)](https://www.npmjs.com/package/@josharsh/xeli)
-[![license](https://img.shields.io/github/license/josharsh/xeli?color=f9e2af)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/josharsh/xeli/release.yml?branch=master&label=release)](https://github.com/josharsh/xeli/actions/workflows/release.yml)
-[![stars](https://img.shields.io/github/stars/josharsh/xeli?style=flat&color=f5e0dc)](https://github.com/josharsh/xeli/stargazers)
+[![license](https://img.shields.io/github/license/ReallyArtificial/xeli?color=f9e2af)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/ReallyArtificial/xeli/release.yml?branch=master&label=release)](https://github.com/ReallyArtificial/xeli/actions/workflows/release.yml)
+[![stars](https://img.shields.io/github/stars/ReallyArtificial/xeli?style=flat&color=f5e0dc)](https://github.com/ReallyArtificial/xeli/stargazers)
 
 Open CSV, JSON, Parquet, and Excel files in a fast TUI spreadsheet. Filter, sort, pivot, and export visually. Ask questions in plain English and let `xeli` write the SQL.
 
@@ -16,9 +18,9 @@ Open CSV, JSON, Parquet, and Excel files in a fast TUI spreadsheet. Filter, sort
 
 ## Try it without installing
 
-→ **[xeli.josharsh.com/playground](https://xeli.josharsh.com/playground)**
+→ **[www.reallyartificial.org/work/xeli/playground/](https://www.reallyartificial.org/work/xeli/playground/)**
 
-DuckDB-WASM in your browser. Drop a CSV, ask a question, nothing leaves the tab.
+DuckDB-WASM in your browser. Load a CSV and query it locally with SQL. Optional AI queries send your question and column schema to your chosen provider using your API key.
 
 ## Install
 
@@ -33,7 +35,9 @@ npm install -g @josharsh/xeli
 brew install josharsh/tap/xeli
 ```
 
-Or grab a [prebuilt binary](https://github.com/josharsh/xeli/releases/latest).
+The npm package and Homebrew tap retain their existing names for compatibility.
+
+Or grab a [prebuilt binary](https://github.com/ReallyArtificial/xeli/releases/latest).
 
 Supported on macOS (Apple Silicon, Intel) and Linux (arm64, x86_64). Windows isn't supported yet, see [#help-wanted](CONTRIBUTING.md#open-help-wanted).
 

@@ -12,7 +12,7 @@ Thanks for being here. xeli is a small project run by one person; PRs and issues
 ## Building from source
 
 ```bash
-git clone https://github.com/josharsh/xeli
+git clone https://github.com/ReallyArtificial/xeli
 cd xeli
 cargo build --release
 ./target/release/xeli examples/employees.csv

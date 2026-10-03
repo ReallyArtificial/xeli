@@ -4,6 +4,9 @@ All notable changes to xeli are documented here. Format follows [Keep a Changelo
 
 ## [Unreleased]
 
+### Changed
+- Moved the source repository to ReallyArtificial/xeli and added a Really Artificial project page and browser playground entry point. Existing npm and Homebrew install commands remain supported.
+
 ## [0.3.0] — 2026-06-29
 
 ### Added
@@ -76,9 +79,10 @@ All notable changes to xeli are documented here. Format follows [Keep a Changelo
 - Command palette (`Ctrl+P`), full undo stack (`u`).
 - Per-platform binaries via cargo-dist: macOS arm64/x86_64, Linux arm64/x86_64.
 
-[Unreleased]: https://github.com/josharsh/xeli/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/josharsh/xeli/compare/v0.1.3...v0.2.0
-[0.1.3]: https://github.com/josharsh/xeli/compare/v0.1.2...v0.1.3
-[0.1.2]: https://github.com/josharsh/xeli/compare/v0.1.1...v0.1.2
-[0.1.1]: https://github.com/josharsh/xeli/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/josharsh/xeli/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ReallyArtificial/xeli/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ReallyArtificial/xeli/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/ReallyArtificial/xeli/compare/v0.1.3...v0.2.0
+[0.1.3]: https://github.com/ReallyArtificial/xeli/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/ReallyArtificial/xeli/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/ReallyArtificial/xeli/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/ReallyArtificial/xeli/releases/tag/v0.1.0
